@@ -1,0 +1,14 @@
+{
+  "name": "context-vault",
+  "version": "1.0.0",
+  "description": "Persistent structured memory for Claude Code. Two skills: prends-note (Claude writes to SQLite on its own initiative, user via /note) and hot-contexte (Claude reasons about what the next session needs, builds a targeted SQL query before compaction). project-mgmt skill for todos with dependencies. Schema is fully dynamic via EAV — no fixed columns, ontology emerges from usage.",
+  "author": {
+    "name": "hazyhaar",
+    "email": "",
+    "url": "https://github.com/hazyhaar"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/hazyhaar/context-vault",
+  "keywords": ["memory", "sqlite", "compaction", "context", "notes", "todos", "persistence"],
+  "category": "productivity"
+}
