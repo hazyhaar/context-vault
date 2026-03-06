@@ -8,9 +8,9 @@ Inscrit immédiatement une information en DB via prends-note.
 
 Exemples :
   /note AFP meeting repoussé au 15
-  /note no CGO, modernc uniquement pour tout SQLite
+  /note no CGO — modernc uniquement pour tout SQLite
   /note Scan() ne doit jamais être appelée depuis un goroutine
-  /note todo : écrire les tests de SessionStart, bloqué par la CI
+  /note todo : écrire les tests de SessionStart, bloqué par CI [high]
 
 ## Comportement
 

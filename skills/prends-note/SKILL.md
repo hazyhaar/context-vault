@@ -4,7 +4,7 @@ description: >-
   Persiste une information qui doit survivre au compactage ou à la prochaine
   session. Invoque dès que tu identifies quelque chose de non-trivial :
   décision, contrainte, pattern écarté, entité clé du domaine, bloquant.
-  N'attends pas qu'on te le demande. L'utilisateur peut aussi l'invoquer
+  N'attends pas qu'on te le demande. L'utilisateur peut aussi invoquer
   via /note ou en langage naturel.
 ---
 
@@ -20,7 +20,7 @@ N'attends pas qu'on te le demande.
 
 ## Avant d'inscrire — toujours
 
-Vérifie d'abord les types et clés existants pour réutiliser ce qui existe :
+Vérifie les types et clés existants pour réutiliser ce qui existe :
 
 ```sql
 SELECT DISTINCT type, COUNT(*) as n
@@ -28,23 +28,30 @@ FROM entities
 WHERE namespace = '<namespace>'
 GROUP BY type ORDER BY n DESC;
 
-SELECT key, COUNT(*) as n
-FROM attributes
-GROUP BY key ORDER BY n DESC LIMIT 15;
+SELECT DISTINCT json_each.key, COUNT(*) as n
+FROM entities, json_each(entities.meta)
+GROUP BY json_each.key ORDER BY n DESC LIMIT 20;
 ```
 
-→ Réutilise ce qui existe.
-  Crée un nouveau type seulement si rien d'équivalent n'existe.
+→ Réutilise ce qui existe. Crée un nouveau type seulement si rien d'équivalent n'existe.
 
 ## Inscris
 
 ```sql
-INSERT INTO entities (namespace, type, label, sensitivity, ts_created, ts_updated, session_origin)
-VALUES (?, ?, ?, 0, unixepoch(), unixepoch(), ?);
+INSERT INTO entities
+  (namespace, type, label, sensitivity, ts_created, ts_updated, session_origin, meta)
+VALUES
+  (?, ?, ?, 0, unixepoch(), unixepoch(), ?,
+   jsonb('{"blob_plus":"...","blob_minus":"..."}'));
+```
 
-INSERT INTO attributes (entity_id, key, value) VALUES
-  (last_insert_rowid(), 'blob_plus',  '...'),
-  (last_insert_rowid(), 'blob_minus', '...');  -- si applicable
+### Mise à jour d'une entité existante
+
+```sql
+UPDATE entities
+SET meta = jsonb_set(meta, '$.blob_plus', '"nouvelle valeur"'),
+    ts_updated = unixepoch()
+WHERE id = ?;
 ```
 
 ### Types courants (non exhaustifs, l'usage étend)
@@ -63,7 +70,7 @@ INSERT INTO attributes (entity_id, key, value) VALUES
 | pattern    | retenu vs anti-pattern                       |
 | credential | référence UNIQUEMENT — jamais la valeur      |
 
-### Clés d'attributs courantes
+### Clés meta courantes
 
 - `blob_plus` : ce qu'il faut savoir (le positif, le retenu)
 - `blob_minus` : ce qu'il faut éviter (l'écarté, les pièges)
@@ -72,6 +79,7 @@ INSERT INTO attributes (entity_id, key, value) VALUES
 - `priority` : high | normal | low
 - `deadline` : date ISO
 - `url` : lien externe
+- `signature` : signature de fonction
 
 ## Quand inscrire
 
@@ -96,13 +104,12 @@ Uniquement : existence, localisation, contexte d'usage.
 
 ```sql
 -- Correct
-INSERT INTO entities (namespace, type, label, sensitivity, ts_created, ts_updated)
-VALUES ('project', 'credential', 'ANTHROPIC_API_KEY', 2, unixepoch(), unixepoch());
-INSERT INTO attributes VALUES (last_insert_rowid(), 'blob_plus', 'présent dans .env');
-INSERT INTO attributes VALUES (last_insert_rowid(), 'target_file', '.env');
+INSERT INTO entities (namespace, type, label, sensitivity, ts_created, ts_updated, meta)
+VALUES ('project', 'credential', 'ANTHROPIC_API_KEY', 2, unixepoch(), unixepoch(),
+        jsonb('{"blob_plus":"présent dans .env","target_file":".env"}'));
 
 -- Jamais
-INSERT INTO attributes VALUES (42, 'value', 'sk-ant-...');
+jsonb('{"value":"sk-ant-..."}')
 ```
 
 ## Confirmation

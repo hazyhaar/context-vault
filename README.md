@@ -3,78 +3,103 @@
 Persistent structured memory for Claude Code.
 
 The LLM is an active participant in its own memory — not a passive logger.
-Skills give Claude the intention and tools to read and write to a local
-SQLite database, in collaboration with the user.
+An HTTP server receives all hook events, writes to SQLite JSONB, and signals
+Claude via `UserPromptSubmit` stdout when accumulated context exceeds the threshold.
 
-## How it works
+## Architecture
 
 ```
-user + claude  →  /note or Claude initiative  →  prends-note  →  SQLite
-                                                                     ↓
-compaction imminent  →  hot-contexte  →  reasoning  →  targeted SELECT
-                                                              ↓
-                                             context for the next Claude
+hooks  →  POST localhost:9742/hook  →  Go server  →  SQLite JSONB
+                                             ↓
+                                      UserPromptSubmit
+                                      RingDumper measure
+                                      stdout if threshold exceeded
+                                             ↓
+                                      Claude sees signal
+                                      invokes prends-note or hot-contexte
 ```
+
+## Hooks used
+
+| Hook | Role |
+|------|------|
+| `SessionStart` | Create session, chmod 600, .gitignore, inject context summary |
+| `UserPromptSubmit` | Log prompt, RingDumper push, signal if threshold exceeded |
+| `PostToolUse` | Buffer full payload as JSONB |
+| `PostToolUseFailure` | Buffer tool errors (fragility patterns) |
+| `Stop` | Buffer last_assistant_message |
+| `PreCompact` | Buffer trigger + custom_instructions (hot-contexte invoked manually) |
+| `SessionEnd` | Close session timestamp |
+| `Setup` | VACUUM + PRAGMA optimize |
 
 ## Skills
 
 | Skill | Description |
 |-------|-------------|
-| **prends-note** | Persists information that must survive compaction. Claude invokes this on its own initiative when it identifies something non-trivial. User can also invoke via `/note`. |
-| **hot-contexte** | Invoked when compaction is imminent. Reasons about what the next Claude needs, fills gaps in DB, then builds a targeted SELECT query. |
-| **project-mgmt** | Structured todos with dependencies, priorities, and deadlines. Persists across compactions and sessions. |
+| **prends-note** | Persists information that must survive compaction. Claude invokes on its own initiative. User can also invoke via `/note`. |
+| **hot-contexte** | Invoked when compaction is imminent. Reasons about what next Claude needs, builds targeted SELECT. |
+| **project-mgmt** | Structured todos with dependencies, priorities, deadlines. Persists across compactions and sessions. |
 
 ## Schema
 
-EAV (Entity-Attribute-Value) model in SQLite. The ontology emerges from
-usage — no fixed types or columns.
+SQLite JSONB. Dynamic — types and attributes emerge from usage.
 
-- **entities** — identity (namespace, type, label, sensitivity)
-- **attributes** — dynamic key/value pairs per entity
-- **relations** — typed edges between entities (depends_on, blocks, subtask_of)
-- **sessions** — session lifecycle tracking
-- **compact_log** — history of compaction reasoning and queries
+- **sessions** — session lifecycle (id, started_at, ended_at, model)
+- **entities** — identity + `meta` JSONB (blob_plus, blob_minus, status, deadline, ...)
+- **relations** — typed edges (depends_on, blocks, subtask_of)
+- **buffer** — raw hook payloads as JSONB (RingDumper input)
+- **compact_log** — compaction reasoning and queries
+
+Requires SQLite >= 3.45.0 (JSONB — January 2024).
+
+## Build
+
+```bash
+# Install dependency (requires network)
+go mod download
+
+# Build for current platform
+go build -o bin/context-vault-$(go env GOOS)-$(go env GOARCH) ./cmd/context-vault
+
+# Cross-compile
+GOOS=darwin  GOARCH=arm64  go build -o bin/context-vault-darwin-arm64  ./cmd/context-vault
+GOOS=darwin  GOARCH=amd64  go build -o bin/context-vault-darwin-amd64  ./cmd/context-vault
+GOOS=linux   GOARCH=amd64  go build -o bin/context-vault-linux-amd64   ./cmd/context-vault
+GOOS=linux   GOARCH=arm64  go build -o bin/context-vault-linux-arm64   ./cmd/context-vault
+```
 
 ## Installation
 
-1. Clone or install the plugin in your Claude Code plugins directory
-2. The `SessionStart` hook automatically:
-   - Creates/migrates the SQLite DB at `.claude/vault.db`
-   - Sets permissions to `600`
-   - Adds `.claude/vault.db` to `.gitignore`
+Configure `.claude/settings.json` in your project:
 
-## Usage
-
-### `/note` command
-
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "scripts/run.sh"}, {"type": "http", "url": "http://localhost:9742/hook/session-start", "timeout": 5}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "http", "url": "http://localhost:9742/hook/user-prompt", "timeout": 5}]}],
+    "PostToolUse": [{"hooks": [{"type": "http", "url": "http://localhost:9742/hook/post-tool", "timeout": 5}]}],
+    "PostToolUseFailure": [{"hooks": [{"type": "http", "url": "http://localhost:9742/hook/post-tool-failure", "timeout": 5}]}],
+    "Stop": [{"hooks": [{"type": "http", "url": "http://localhost:9742/hook/stop", "timeout": 5}]}],
+    "PreCompact": [{"hooks": [{"type": "http", "url": "http://localhost:9742/hook/pre-compact", "timeout": 10}]}],
+    "SessionEnd": [{"hooks": [{"type": "http", "url": "http://localhost:9742/hook/session-end", "timeout": 5}]}],
+    "Setup": [{"hooks": [{"type": "http", "url": "http://localhost:9742/hook/setup", "timeout": 30}]}]
+  }
+}
 ```
-/note AFP meeting repoussé au 15
-/note no CGO, modernc uniquement pour tout SQLite
-/note todo : écrire les tests de SessionStart
-```
-
-Claude translates free text into structured INSERTs.
-
-### Automatic note-taking
-
-Claude invokes `prends-note` on its own when it identifies:
-- A decision being made
-- A constraint discovered
-- A pattern rejected (blob_minus is as important as blob_plus)
-- A file becoming central to the session
-- A blocker emerging
-
-### Project management
-
-When multiple tasks emerge, Claude uses `project-mgmt` to create
-structured todos with dependencies and priorities.
 
 ## Security
 
-- `type=credential` never stores values — only existence and location
-- `sensitivity=2` entities are excluded from all `hot-contexte` SELECTs
-- DB file is `chmod 600` on creation
+- `vault.db` is `chmod 600` on creation
 - `.claude/vault.db` is automatically gitignored
+- `sensitivity=2` entities are excluded from all `hot-contexte` SELECTs
+- `type=credential` never stores values — only existence and location
+
+## Known unknowns (validate before v1)
+
+1. **PreCompact stdout** — is it injected into the compacted context? Sources say no. If confirmed, hot-contexte must be invoked manually before `/compact`.
+2. **HTTP hook timeout 5s** — sufficient for a SQLite INSERT under load?
+3. **modernc SQLite version** — confirm `>= 3.45.0` with `go list -m modernc.org/sqlite`
+4. **UserPromptSubmit stdout max length** — short signal `[vault] ~N tokens` has no risk.
 
 ## License
 

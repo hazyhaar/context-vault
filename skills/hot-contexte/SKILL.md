@@ -30,33 +30,52 @@ Réponds à ces questions avant d'écrire la moindre requête :
 
 Si le raisonnement révèle des trous → invoquer prends-note avant de continuer.
 
-## Étape 3 — Construire le SELECT
+## Étape 3 — SELECT ciblé
 
 Requête ciblée sur l'état actuel. **Pas un SELECT * générique.**
 
 Les entités `sensitivity=2` sont toujours exclues.
 
-Exemple (session de débogage hook) :
+```sql
+SELECT label,
+       meta->>'$.blob_plus'  AS retenu,
+       meta->>'$.blob_minus' AS ecarté,
+       type
+FROM entities
+WHERE namespace = ?
+  AND sensitivity < 2
+  AND (
+    type IN ('decision', 'constraint', 'todo')
+    OR (type = 'function' AND label LIKE '%<zone chaude>%')
+  )
+ORDER BY ts_updated DESC
+LIMIT 25;
+```
+
+### Lire le buffer récent (payloads hooks)
 
 ```sql
-SELECT e.type, e.label, a_plus.value AS blob_plus, a_minus.value AS blob_minus
-FROM entities e
-LEFT JOIN attributes a_plus  ON a_plus.entity_id  = e.id AND a_plus.key  = 'blob_plus'
-LEFT JOIN attributes a_minus ON a_minus.entity_id = e.id AND a_minus.key = 'blob_minus'
-WHERE e.namespace = 'context-vault'
-  AND e.sensitivity < 2
-  AND (
-    e.type IN ('decision', 'constraint', 'todo')
-    OR (e.type = 'function' AND e.label LIKE '%Compact%')
-  )
-ORDER BY e.ts_updated DESC;
+-- Dernier prompt utilisateur
+SELECT payload->>'$.prompt'
+FROM buffer WHERE hook = 'user_prompt'
+ORDER BY ts DESC LIMIT 1;
+
+-- Dernière réponse assistant
+SELECT payload->>'$.last_assistant_message'
+FROM buffer WHERE hook = 'stop'
+ORDER BY ts DESC LIMIT 1;
+
+-- Erreurs d'outils récentes
+SELECT ts, payload->>'$.tool_name' AS outil, payload->>'$.error' AS erreur
+FROM buffer WHERE hook = 'post_tool_failure'
+ORDER BY ts DESC LIMIT 10;
 ```
 
 ## Étape 4 — Logger
 
 ```sql
-INSERT INTO compact_log (ts, session_id, reasoning, query_used, result_text)
-VALUES (unixepoch(), ?, '<step 1 reasoning>', '<query>', '<résultat>');
+INSERT INTO compact_log (ts, session_id, trigger, reasoning, query_used, result_text)
+VALUES (unixepoch(), ?, 'auto', '<step 1 reasoning>', '<query>', '<résultat>');
 ```
 
 ## Invariants
@@ -64,3 +83,4 @@ VALUES (unixepoch(), ?, '<step 1 reasoning>', '<query>', '<résultat>');
 - Commence **toujours** par le raisonnement, **jamais** par un SELECT
 - `sensitivity=2` n'entre **jamais** dans un SELECT
 - Log chaque compactage dans `compact_log`
+- PreCompact stdout n'est PAS injecté — cette skill est invoquée manuellement avant `/compact`
