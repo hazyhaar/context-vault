@@ -1,0 +1,7 @@
+.claude/vault.db
+.claude/vault.db-wal
+.claude/vault.db-shm
+.claude/vault.log
+.mcp.json
+bin/
+/context-vault
