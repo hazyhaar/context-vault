@@ -73,6 +73,15 @@ CREATE TABLE IF NOT EXISTS buffer (
     processed  INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS todo_steps (
+    todo_id  INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    step     TEXT    NOT NULL,
+    required INTEGER DEFAULT 1,
+    done     INTEGER DEFAULT 0,
+    done_at  INTEGER,
+    PRIMARY KEY (todo_id, step)
+);
+
 CREATE TABLE IF NOT EXISTS compact_log (
     id          INTEGER PRIMARY KEY,
     ts          INTEGER NOT NULL,
@@ -161,7 +170,7 @@ func NewServer(dbPath, projectDir string) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(2) // 2: one for MCP requests, one for checkpoint goroutine
 
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
@@ -261,7 +270,7 @@ func (s *Server) buildStartContext(sessionID, trigger string) string {
 
 	// Single query: todos, decisions, constraints — ordered by type then priority/recency
 	rows, err := s.db.QueryContext(context.Background(), `
-		SELECT type, label, meta->>'$.priority', meta->>'$.blob_plus'
+		SELECT id, type, label, meta->>'$.priority', meta->>'$.blob_plus', meta->>'$.status'
 		FROM entities
 		WHERE type IN ('todo','decision','constraint')
 		  AND (type != 'todo' OR meta->>'$.status' != 'done')
@@ -275,15 +284,22 @@ func (s *Server) buildStartContext(sessionID, trigger string) string {
 	if err != nil {
 		slog.Warn("buildStartContext query", "err", err)
 	} else {
-		var todos, decisions, constraints []string
+		type todoEntry struct {
+			id     int64
+			line   string
+			status string
+		}
+		var todoEntries []todoEntry
+		var decisions, constraints []string
 		for rows.Next() {
-			var typ, label, priority, blob string
-			if rows.Scan(&typ, &label, &priority, &blob) != nil {
+			var id int64
+			var typ, label, priority, blob, status string
+			if rows.Scan(&id, &typ, &label, &priority, &blob, &status) != nil {
 				continue
 			}
 			switch typ {
 			case "todo":
-				todos = append(todos, fmt.Sprintf("- %s [%s]", label, priority))
+				todoEntries = append(todoEntries, todoEntry{id: id, line: fmt.Sprintf("- #%d %s [%s]", id, label, priority), status: status})
 			case "decision":
 				if blob != "" {
 					decisions = append(decisions, fmt.Sprintf("- %s : %s", label, blob))
@@ -299,7 +315,31 @@ func (s *Server) buildStartContext(sessionID, trigger string) string {
 		}
 		rows.Close()
 
-		if len(todos) > 0 {
+		// Enrich in_progress todos with remaining steps
+		if len(todoEntries) > 0 {
+			var todos []string
+			for _, te := range todoEntries {
+				line := te.line
+				if te.status == "in_progress" {
+					stepRows, err := s.db.QueryContext(context.Background(),
+						`SELECT step, done FROM todo_steps WHERE todo_id = ? AND required = 1 ORDER BY rowid`, te.id)
+					if err == nil {
+						var pending []string
+						for stepRows.Next() {
+							var step string
+							var done int
+							if stepRows.Scan(&step, &done) == nil && done == 0 {
+								pending = append(pending, step)
+							}
+						}
+						stepRows.Close()
+						if len(pending) > 0 {
+							line += fmt.Sprintf(" — steps restants: %s", strings.Join(pending, ", "))
+						}
+					}
+				}
+				todos = append(todos, line)
+			}
 			sb.WriteString("Todos ouverts :\n" + strings.Join(todos, "\n") + "\n")
 		}
 		if len(decisions) > 0 {

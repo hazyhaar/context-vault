@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 )
 
 // ── JSON-RPC 2.0 wire types ─────────────────────────────────────────────────
@@ -56,6 +57,17 @@ type mcpToolResult struct {
 // ── Main loop ────────────────────────────────────────────────────────────────
 
 func runMCP(srv *Server) {
+	// WAL checkpoint goroutine — prevents WAL bloat when multiple MCP instances share vault.db.
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			if _, err := srv.db.Exec("PRAGMA wal_checkpoint(PASSIVE)"); err != nil {
+				slog.Warn("mcp: wal checkpoint", "err", err)
+			}
+		}
+	}()
+
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)
 	enc := json.NewEncoder(os.Stdout)
@@ -138,6 +150,7 @@ func toolDefinitions() []mcpToolDef {
 				"type": "object",
 				"properties": map[string]any{
 					"namespace": map[string]any{"type": "string", "description": "Filtrer par namespace (optionnel)"},
+					"session":   map[string]any{"type": "string", "description": "Filtrer par session_origin (optionnel)"},
 				},
 			},
 		},
@@ -150,6 +163,7 @@ func toolDefinitions() []mcpToolDef {
 					"type":      map[string]any{"type": "string", "description": "Type d'entite (todo, decision, constraint, pattern, function, etc.)"},
 					"namespace": map[string]any{"type": "string", "description": "Filtrer par namespace"},
 					"query":     map[string]any{"type": "string", "description": "Recherche substring sur le label"},
+					"session":   map[string]any{"type": "string", "description": "Filtrer par session_origin (optionnel)"},
 					"limit":     map[string]any{"type": "number", "description": "Nombre max de resultats (defaut 20, max 50)"},
 				},
 			},
@@ -189,6 +203,7 @@ func toolDefinitions() []mcpToolDef {
 				"type": "object",
 				"properties": map[string]any{
 					"namespace":    map[string]any{"type": "string", "description": "Filtrer par namespace"},
+					"session":      map[string]any{"type": "string", "description": "Filtrer par session_origin (optionnel)"},
 					"include_done": map[string]any{"type": "boolean", "description": "Inclure les todos termines (defaut false)"},
 				},
 			},
@@ -217,6 +232,30 @@ func toolDefinitions() []mcpToolDef {
 				},
 			},
 		},
+		{
+			Name:        "vault_add_steps",
+			Description: "Ajoute des etapes a un todo existant. Ignore les doublons (INSERT OR IGNORE).",
+			InputSchema: map[string]any{
+				"type":     "object",
+				"required": []string{"todo_id", "steps"},
+				"properties": map[string]any{
+					"todo_id": map[string]any{"type": "number", "description": "ID du todo"},
+					"steps":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Liste des etapes a ajouter"},
+				},
+			},
+		},
+		{
+			Name:        "vault_step_done",
+			Description: "Marque une etape comme terminee. Si toutes les etapes required sont done, le todo passe automatiquement a done.",
+			InputSchema: map[string]any{
+				"type":     "object",
+				"required": []string{"todo_id", "step"},
+				"properties": map[string]any{
+					"todo_id": map[string]any{"type": "number", "description": "ID du todo"},
+					"step":    map[string]any{"type": "string", "description": "Nom de l'etape a marquer done"},
+				},
+			},
+		},
 	}
 }
 
@@ -238,6 +277,10 @@ func dispatchTool(srv *Server, name string, args json.RawMessage) mcpToolResult 
 		return srv.mcpCreateRelation(args)
 	case "vault_delete_entity":
 		return srv.mcpDeleteEntity(args)
+	case "vault_add_steps":
+		return srv.mcpAddSteps(args)
+	case "vault_step_done":
+		return srv.mcpStepDone(args)
 	default:
 		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "unknown tool: " + name}}, IsError: true}
 	}
@@ -248,6 +291,7 @@ func dispatchTool(srv *Server, name string, args json.RawMessage) mcpToolResult 
 func (s *Server) mcpGetContext(args json.RawMessage) mcpToolResult {
 	var p struct {
 		Namespace string `json:"namespace"`
+		Session   string `json:"session"`
 	}
 	json.Unmarshal(args, &p)
 
@@ -261,6 +305,10 @@ func (s *Server) mcpGetContext(args json.RawMessage) mcpToolResult {
 	if p.Namespace != "" {
 		query += ` AND namespace = ?`
 		qargs = append(qargs, p.Namespace)
+	}
+	if p.Session != "" {
+		query += ` AND session_origin = ?`
+		qargs = append(qargs, p.Session)
 	}
 
 	query += ` ORDER BY
@@ -328,6 +376,7 @@ func (s *Server) mcpSearchEntities(args json.RawMessage) mcpToolResult {
 		Type      string `json:"type"`
 		Namespace string `json:"namespace"`
 		Query     string `json:"query"`
+		Session   string `json:"session"`
 		Limit     int    `json:"limit"`
 	}
 	json.Unmarshal(args, &p)
@@ -356,6 +405,10 @@ func (s *Server) mcpSearchEntities(args json.RawMessage) mcpToolResult {
 	if p.Query != "" {
 		query += ` AND label LIKE '%' || ? || '%'`
 		qargs = append(qargs, p.Query)
+	}
+	if p.Session != "" {
+		query += ` AND session_origin = ?`
+		qargs = append(qargs, p.Session)
 	}
 	query += ` ORDER BY ts_updated DESC LIMIT ?`
 	qargs = append(qargs, p.Limit)
@@ -464,10 +517,21 @@ func (s *Server) mcpUpsertEntity(args json.RawMessage) mcpToolResult {
 		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "namespace and type are required for create"}}, IsError: true}
 	}
 
+	// Auto-inject created_at timestamp for todos
+	if p.Type == "todo" {
+		var metaMap map[string]any
+		if json.Unmarshal(metaBlob, &metaMap) == nil {
+			if _, exists := metaMap["created_at"]; !exists {
+				metaMap["created_at"] = time.Now().UTC().Format(time.RFC3339)
+				metaBlob, _ = json.Marshal(metaMap)
+			}
+		}
+	}
+
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO entities (namespace, type, label, sensitivity, ts_created, ts_updated, meta)
-		 VALUES (?, ?, ?, ?, unixepoch(), unixepoch(), jsonb(?))`,
-		p.Namespace, p.Type, p.Label, p.Sensitivity, string(metaBlob))
+		`INSERT INTO entities (namespace, type, label, sensitivity, ts_created, ts_updated, session_origin, meta)
+		 VALUES (?, ?, ?, ?, unixepoch(), unixepoch(), ?, jsonb(?))`,
+		p.Namespace, p.Type, p.Label, p.Sensitivity, s.currentSession(), string(metaBlob))
 	if err != nil {
 		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "insert error: " + err.Error()}}, IsError: true}
 	}
@@ -489,10 +553,27 @@ func (s *Server) mcpTodoTransition(args json.RawMessage) mcpToolResult {
 		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "invalid status: " + p.Status}}, IsError: true}
 	}
 
-	res, err := s.db.ExecContext(context.Background(),
-		`UPDATE entities SET meta = jsonb_set(meta, '$.status', jsonb(?)), ts_updated = unixepoch()
-		 WHERE id = ? AND type = 'todo'`,
-		`"`+p.Status+`"`, p.ID)
+	// Set status + horodatage de la transition dans meta JSONB.
+	now := `"` + time.Now().UTC().Format(time.RFC3339) + `"`
+	statusVal := `"` + p.Status + `"`
+
+	var query string
+	switch p.Status {
+	case "in_progress":
+		query = `UPDATE entities SET meta = jsonb_set(jsonb_set(meta, '$.status', jsonb(?)), '$.started_at', jsonb(?)), ts_updated = unixepoch() WHERE id = ? AND type = 'todo'`
+	case "done":
+		query = `UPDATE entities SET meta = jsonb_set(jsonb_set(meta, '$.status', jsonb(?)), '$.completed_at', jsonb(?)), ts_updated = unixepoch() WHERE id = ? AND type = 'todo'`
+	default:
+		query = `UPDATE entities SET meta = jsonb_set(meta, '$.status', jsonb(?)), ts_updated = unixepoch() WHERE id = ? AND type = 'todo'`
+	}
+
+	var res sql.Result
+	var err error
+	if p.Status == "in_progress" || p.Status == "done" {
+		res, err = s.db.ExecContext(context.Background(), query, statusVal, now, p.ID)
+	} else {
+		res, err = s.db.ExecContext(context.Background(), query, statusVal, p.ID)
+	}
 	if err != nil {
 		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "update error: " + err.Error()}}, IsError: true}
 	}
@@ -506,6 +587,7 @@ func (s *Server) mcpTodoTransition(args json.RawMessage) mcpToolResult {
 func (s *Server) mcpListTodos(args json.RawMessage) mcpToolResult {
 	var p struct {
 		Namespace   string `json:"namespace"`
+		Session     string `json:"session"`
 		IncludeDone bool   `json:"include_done"`
 	}
 	json.Unmarshal(args, &p)
@@ -527,6 +609,10 @@ func (s *Server) mcpListTodos(args json.RawMessage) mcpToolResult {
 	if p.Namespace != "" {
 		query += ` AND e.namespace = ?`
 		qargs = append(qargs, p.Namespace)
+	}
+	if p.Session != "" {
+		query += ` AND e.session_origin = ?`
+		qargs = append(qargs, p.Session)
 	}
 	query += ` GROUP BY e.id
 		ORDER BY
@@ -568,6 +654,23 @@ func (s *Server) mcpListTodos(args json.RawMessage) mcpToolResult {
 		sb.WriteString(fmt.Sprintf("#%d %s%s — %s%s%s\n", id, label.String, pri, st, dl, bl))
 		if description.Valid && description.String != "" {
 			sb.WriteString("   " + description.String + "\n")
+		}
+		// Show steps if any
+		stepRows, stepErr := s.db.QueryContext(context.Background(),
+			`SELECT step, done FROM todo_steps WHERE todo_id = ? ORDER BY rowid`, id)
+		if stepErr == nil {
+			for stepRows.Next() {
+				var step string
+				var done int
+				if stepRows.Scan(&step, &done) == nil {
+					mark := "[ ]"
+					if done == 1 {
+						mark = "[x]"
+					}
+					sb.WriteString(fmt.Sprintf("   %s %s\n", mark, step))
+				}
+			}
+			stepRows.Close()
 		}
 	}
 
@@ -619,4 +722,90 @@ func (s *Server) mcpDeleteEntity(args json.RawMessage) mcpToolResult {
 		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("entity %d not found", p.ID)}}, IsError: true}
 	}
 	return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("deleted entity %d", p.ID)}}}
+}
+
+func (s *Server) mcpAddSteps(args json.RawMessage) mcpToolResult {
+	var p struct {
+		TodoID int64    `json:"todo_id"`
+		Steps  []string `json:"steps"`
+	}
+	if err := json.Unmarshal(args, &p); err != nil {
+		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "invalid params: " + err.Error()}}, IsError: true}
+	}
+	if len(p.Steps) == 0 {
+		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "steps array is empty"}}, IsError: true}
+	}
+
+	// Verify todo exists
+	var dummy int
+	err := s.db.QueryRowContext(context.Background(),
+		`SELECT 1 FROM entities WHERE id = ? AND type = 'todo'`, p.TodoID).Scan(&dummy)
+	if err != nil {
+		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("todo %d not found", p.TodoID)}}, IsError: true}
+	}
+
+	ctx := context.Background()
+	inserted := 0
+	for _, step := range p.Steps {
+		step = strings.TrimSpace(step)
+		if step == "" {
+			continue
+		}
+		res, err := s.db.ExecContext(ctx,
+			`INSERT OR IGNORE INTO todo_steps (todo_id, step) VALUES (?, ?)`, p.TodoID, step)
+		if err != nil {
+			return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "insert error: " + err.Error()}}, IsError: true}
+		}
+		n, _ := res.RowsAffected()
+		inserted += int(n)
+	}
+	return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("todo %d: %d steps added (%d total provided)", p.TodoID, inserted, len(p.Steps))}}}
+}
+
+func (s *Server) mcpStepDone(args json.RawMessage) mcpToolResult {
+	var p struct {
+		TodoID int64  `json:"todo_id"`
+		Step   string `json:"step"`
+	}
+	if err := json.Unmarshal(args, &p); err != nil {
+		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "invalid params: " + err.Error()}}, IsError: true}
+	}
+
+	ctx := context.Background()
+
+	// Mark step done
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE todo_steps SET done = 1, done_at = unixepoch() WHERE todo_id = ? AND step = ? AND done = 0`,
+		p.TodoID, p.Step)
+	if err != nil {
+		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "update error: " + err.Error()}}, IsError: true}
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		// Check if step exists but already done
+		var exists int
+		s.db.QueryRowContext(ctx,
+			`SELECT 1 FROM todo_steps WHERE todo_id = ? AND step = ?`, p.TodoID, p.Step).Scan(&exists)
+		if exists == 1 {
+			return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("step already done: %s", p.Step)}}}
+		}
+		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("step not found: %s (todo %d)", p.Step, p.TodoID)}}, IsError: true}
+	}
+
+	// Check if all required steps are done → auto-transition todo to done
+	var remaining int
+	s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM todo_steps WHERE todo_id = ? AND required = 1 AND done = 0`,
+		p.TodoID).Scan(&remaining)
+
+	if remaining == 0 {
+		// Auto-transition
+		now := `"` + time.Now().UTC().Format(time.RFC3339) + `"`
+		s.db.ExecContext(ctx,
+			`UPDATE entities SET meta = jsonb_set(jsonb_set(meta, '$.status', jsonb('"done"')), '$.completed_at', jsonb(?)), ts_updated = unixepoch() WHERE id = ? AND type = 'todo'`,
+			now, p.TodoID)
+		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("step done: %s — todo %d auto-transitioned to done (all required steps complete)", p.Step, p.TodoID)}}}
+	}
+
+	return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("step done: %s — %d required steps remaining", p.Step, remaining)}}}
 }

@@ -25,11 +25,12 @@ Serveur HTTP hooks pour mémoire persistante Claude Code. Reçoit les événemen
 | Fichier | Rôle |
 |---------|------|
 | `cmd/context-vault/main.go` | Serveur HTTP, schema SQLite, RingDumper, tous les handlers |
-| `cmd/context-vault/mcp.go` | Serveur MCP stdio (JSON-RPC 2.0), 7 outils vault CRUD |
+| `cmd/context-vault/mcp.go` | Serveur MCP stdio (JSON-RPC 2.0), 9 outils vault CRUD |
 | `scripts/run.sh` | Lanceur SessionStart — démarre le binaire si port libre |
 | `skills/prends-note/SKILL.md` | Skill : LLM inscrit des entités en DB de sa propre initiative |
 | `skills/hot-contexte/SKILL.md` | Skill : SELECT ciblé avant compaction |
 | `skills/project-mgmt/SKILL.md` | Skill : todos structurés avec dépendances |
+| `skills/session-code/SKILL.md` | Skill : orchestration session dev (pick→steps→code→test→done) |
 | `.claude/commands/note.md` | Commande `/note` — inscription par l'utilisateur |
 
 ## Types clés
@@ -67,6 +68,10 @@ Créer un `.mcp.json` à la racine du projet cible (pas du repo context-vault) :
 - `command` : chemin absolu vers le binaire compilé
 - `-project` : racine du projet — c'est là que `.claude/vault.db` sera créé
 - Ce fichier est **machine-specific** (chemins absolus) → gitignored, jamais commité
+
+## Convention de tracking
+
+**Pas de modification de fichier sans vault todo préalable.** Le vault est le système de tracking unique. Créer la todo (même rapide, même une ligne) AVANT d'éditer un fichier. Ça garantit la traçabilité entre sessions et empêche les modifications orphelines.
 
 ## Invariants et pièges connus
 
