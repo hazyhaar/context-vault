@@ -783,7 +783,7 @@ type AnsweredCheckpoint struct {
 	TsUpdated     int64
 }
 
-// NewCheckpoint represents a newly created blocking checkpoint (no answer yet).
+// NewCheckpoint represents a newly created checkpoint (no answer yet).
 type NewCheckpoint struct {
 	ID            int64
 	Label         string
@@ -797,7 +797,6 @@ func (v *Vault) PollAnsweredCheckpoints(watermark int64) ([]AnsweredCheckpoint, 
 	const query = `SELECT id, label, json_extract(meta, '$.answer'), COALESCE(session_origin, ''), ts_updated
 		FROM entities
 		WHERE type = 'checkpoint'
-		  AND json_extract(meta, '$.blocking') = 1
 		  AND json_extract(meta, '$.answer') IS NOT NULL
 		  AND ts_updated > ?
 		ORDER BY ts_updated ASC`
@@ -818,12 +817,11 @@ func (v *Vault) PollAnsweredCheckpoints(watermark int64) ([]AnsweredCheckpoint, 
 	return results, rows.Err()
 }
 
-// PollNewCheckpoints returns blocking checkpoints created after watermark that have no answer yet.
+// PollNewCheckpoints returns checkpoints created after watermark that have no answer yet.
 func (v *Vault) PollNewCheckpoints(watermark int64) ([]NewCheckpoint, error) {
 	const query = `SELECT id, label, COALESCE(json_extract(meta, '$.question'), ''), COALESCE(session_origin, ''), ts_created
 		FROM entities
 		WHERE type = 'checkpoint'
-		  AND json_extract(meta, '$.blocking') = 1
 		  AND json_extract(meta, '$.answer') IS NULL
 		  AND ts_created > ?
 		ORDER BY ts_created ASC`
