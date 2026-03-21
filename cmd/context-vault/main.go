@@ -76,10 +76,11 @@ CREATE TABLE IF NOT EXISTS buffer (
 CREATE TABLE IF NOT EXISTS todo_steps (
     todo_id  INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
     step     TEXT    NOT NULL,
+    step_key TEXT    NOT NULL,
     required INTEGER DEFAULT 1,
     done     INTEGER DEFAULT 0,
     done_at  INTEGER,
-    PRIMARY KEY (todo_id, step)
+    PRIMARY KEY (todo_id, step_key)
 );
 
 CREATE TABLE IF NOT EXISTS compact_log (
@@ -152,11 +153,12 @@ func (r *RingDumper) Total() int {
 // Server holds the HTTP server state. Must be created via NewServer.
 // mu protects rings and lastSessionID. db is safe for concurrent use (sql.DB internal pool).
 type Server struct {
-	db            *sql.DB
-	rings         map[string]*RingDumper // per-session ring buffers, guarded by mu
-	projectDir    string
-	lastSessionID string // fallback when payload has no session_id, guarded by mu
-	mu            sync.RWMutex
+	db             *sql.DB
+	rings          map[string]*RingDumper // per-session ring buffers, guarded by mu
+	projectDir     string
+	lastSessionID  string // fallback when payload has no session_id, guarded by mu
+	channelEnabled bool   // true when -channel flag is passed (MCP channel mode)
+	mu             sync.RWMutex
 }
 
 // CLAUDE:WARN touches filesystem (MkdirAll, Chmod) and opens SQLite. DSN includes _pragma for WAL/FK.
@@ -176,6 +178,17 @@ func NewServer(dbPath, projectDir string) (*Server, error) {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
+
+	// Migration: add step_key column to todo_steps if missing (v2025-03-21).
+	// Backfill step_key from prefix before ':' or full step text.
+	db.Exec(`ALTER TABLE todo_steps ADD COLUMN step_key TEXT NOT NULL DEFAULT ''`)
+	db.Exec(`UPDATE todo_steps SET step_key = CASE
+		WHEN instr(step, ':') > 0 THEN trim(substr(step, 1, instr(step, ':') - 1))
+		ELSE step END
+		WHERE step_key = ''`)
+	// Recreate PK with step_key: SQLite can't alter PK, so we just add a unique index.
+	// New rows use step_key as PK via the schema. Old rows get the unique index.
+	db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_todo_steps_key ON todo_steps(todo_id, step_key)`)
 
 	if err := os.Chmod(dbPath, 0600); err != nil {
 		slog.Warn("chmod failed", "path", dbPath, "err", err)
@@ -658,10 +671,13 @@ func main() {
 		case "mcp":
 			// MCP stdio server — JSON-RPC 2.0 over stdin/stdout
 			projectDir := ""
+			channelEnabled := false
 			for i, arg := range os.Args[2:] {
 				if arg == "-project" && i+3 < len(os.Args) {
 					projectDir = os.Args[i+3]
-					break
+				}
+				if arg == "-channel" {
+					channelEnabled = true
 				}
 			}
 			if projectDir == "" {
@@ -677,7 +693,7 @@ func main() {
 				os.Exit(1)
 			}
 			defer srv.db.Close()
-			runMCP(srv)
+			runMCP(srv, channelEnabled)
 			return
 		}
 	}

@@ -1,4 +1,4 @@
-// CLAUDE:SUMMARY MCP stdio server — JSON-RPC 2.0 over stdin/stdout, 7 vault tools for entity CRUD.
+// CLAUDE:SUMMARY MCP stdio server — JSON-RPC 2.0 over stdin/stdout, 10 vault tools for entity CRUD.
 // CLAUDE:DEPENDS main.go (same package: Server, NewServer, context.Background SQL pattern)
 // CLAUDE:EXPORTS runMCP (package main — called by main() when os.Args[1]=="mcp")
 package main
@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -56,7 +57,34 @@ type mcpToolResult struct {
 
 // ── Main loop ────────────────────────────────────────────────────────────────
 
-func runMCP(srv *Server) {
+// stdoutWriter serializes writes to the JSON-RPC stdout stream.
+// Both the main request loop and the channel polling goroutine write here.
+type stdoutWriter struct {
+	mu  sync.Mutex
+	enc *json.Encoder
+}
+
+func newStdoutWriter() *stdoutWriter {
+	return &stdoutWriter{enc: json.NewEncoder(os.Stdout)}
+}
+
+func (w *stdoutWriter) encode(v any) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.enc.Encode(v)
+}
+
+// jsonrpcNotification is a server-initiated notification (no ID field).
+type jsonrpcNotification struct {
+	JSONRPC string `json:"jsonrpc"`
+	Method  string `json:"method"`
+	Params  any    `json:"params"`
+}
+
+func runMCP(srv *Server, channelEnabled bool) {
+	out := newStdoutWriter()
+	srv.channelEnabled = channelEnabled
+
 	// WAL checkpoint goroutine — prevents WAL bloat when multiple MCP instances share vault.db.
 	go func() {
 		ticker := time.NewTicker(2 * time.Minute)
@@ -68,9 +96,15 @@ func runMCP(srv *Server) {
 		}
 	}()
 
+	// Channel polling goroutine — only starts when -channel flag is passed.
+	// Detects checkpoint answers and pushes them as channel events.
+	if channelEnabled {
+		slog.Info("mcp: channel mode enabled — polling checkpoints")
+		go channelPollCheckpoints(srv, out)
+	}
+
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)
-	enc := json.NewEncoder(os.Stdout)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -84,7 +118,7 @@ func runMCP(srv *Server) {
 		}
 		resp := handleMCPRequest(srv, &req)
 		if resp != nil {
-			if err := enc.Encode(resp); err != nil {
+			if err := out.encode(resp); err != nil {
 				slog.Error("mcp: encode response", "err", err)
 				return
 			}
@@ -95,22 +129,95 @@ func runMCP(srv *Server) {
 	}
 }
 
+// channelPollCheckpoints polls vault.db every 3s for blocking checkpoints that
+// received an answer (meta->>'answer' non-NULL). When found, it pushes a
+// notifications/claude/channel event on stdout so Claude can resume work.
+func channelPollCheckpoints(srv *Server, out *stdoutWriter) {
+	// Watermark: only notify checkpoints updated after this timestamp.
+	// Start from now — we don't replay old answers.
+	watermark := time.Now().Unix()
+
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	const query = `SELECT id, label, json_extract(meta, '$.answer'), ts_updated
+		FROM entities
+		WHERE type = 'checkpoint'
+		  AND json_extract(meta, '$.blocking') = 1
+		  AND json_extract(meta, '$.answer') IS NOT NULL
+		  AND ts_updated > ?
+		ORDER BY ts_updated ASC`
+
+	for range ticker.C {
+		rows, err := srv.db.QueryContext(context.Background(), query, watermark)
+		if err != nil {
+			slog.Warn("channel: poll checkpoints", "err", err)
+			continue
+		}
+
+		for rows.Next() {
+			var id int64
+			var label, answer string
+			var tsUpdated int64
+			if err := rows.Scan(&id, &label, &answer, &tsUpdated); err != nil {
+				slog.Warn("channel: scan checkpoint", "err", err)
+				continue
+			}
+
+			// Push channel notification
+			notif := jsonrpcNotification{
+				JSONRPC: "2.0",
+				Method:  "notifications/claude/channel",
+				Params: map[string]any{
+					"content": fmt.Sprintf("Checkpoint #%d answered.\nLabel: %s\nAnswer: %s", id, label, answer),
+					"meta": map[string]string{
+						"checkpoint_id": fmt.Sprintf("%d", id),
+						"event":         "checkpoint_answered",
+					},
+				},
+			}
+			if err := out.encode(notif); err != nil {
+				slog.Error("channel: push notification", "err", err)
+				rows.Close()
+				return
+			}
+			slog.Info("channel: pushed checkpoint answer", "id", id, "label", label)
+
+			// Advance watermark
+			if tsUpdated > watermark {
+				watermark = tsUpdated
+			}
+		}
+		rows.Close()
+	}
+}
+
 // ── Router ───────────────────────────────────────────────────────────────────
 
 func handleMCPRequest(srv *Server, req *jsonrpcRequest) *jsonrpcResponse {
 	switch req.Method {
 	case "initialize":
+		caps := map[string]any{"tools": map[string]any{}}
+		result := map[string]any{
+			"protocolVersion": "2024-11-05",
+			"capabilities":   caps,
+			"serverInfo": map[string]any{
+				"name":    "context-vault",
+				"version": "1.2.0",
+			},
+		}
+		if srv.channelEnabled {
+			caps["experimental"] = map[string]any{"claude/channel": map[string]any{}}
+			result["instructions"] = "Events from the context-vault channel arrive as <channel source=\"context-vault\" event=\"checkpoint_answered\" checkpoint_id=\"N\">. " +
+				"They indicate that a blocking checkpoint you created has been answered by the supervisor. " +
+				"Read the answer in the event body and resume your work accordingly. " +
+				"If the answer says 'approuver' or equivalent, continue with the approved approach. " +
+				"If the answer says 'refuser' or gives a different directive, follow that directive."
+		}
 		return &jsonrpcResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
-			Result: map[string]any{
-				"protocolVersion": "2024-11-05",
-				"capabilities":   map[string]any{"tools": map[string]any{}},
-				"serverInfo": map[string]any{
-					"name":    "context-vault",
-					"version": "1.1.0",
-				},
-			},
+			Result:  result,
 		}
 
 	case "notifications/initialized", "notifications/cancelled":
@@ -145,7 +252,7 @@ func toolDefinitions() []mcpToolDef {
 	return []mcpToolDef{
 		{
 			Name:        "vault_get_context",
-			Description: "Retourne les todos, decisions et contraintes actives du vault. Equivalent de buildStartContext.",
+			Description: "Retourne les checkpoints, todos, decisions et contraintes actives du vault. Equivalent de buildStartContext.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -177,7 +284,7 @@ func toolDefinitions() []mcpToolDef {
 				"properties": map[string]any{
 					"id":          map[string]any{"type": "number", "description": "ID entite pour update (omit pour create)"},
 					"namespace":   map[string]any{"type": "string", "description": "Namespace (requis pour create)"},
-					"type":        map[string]any{"type": "string", "description": "Type d'entite (requis pour create)", "enum": []string{"function", "type", "package", "file", "decision", "constraint", "todo", "api", "dependency", "pattern", "credential"}},
+					"type":        map[string]any{"type": "string", "description": "Type d'entite (requis pour create)", "enum": []string{"function", "type", "package", "file", "decision", "constraint", "todo", "mission", "api", "dependency", "pattern", "credential", "checkpoint"}},
 					"label":       map[string]any{"type": "string", "description": "Label de l'entite"},
 					"sensitivity": map[string]any{"type": "number", "description": "0=public, 1=internal, 2=secret (defaut 0)"},
 					"meta":        map[string]any{"type": "object", "description": "Metadonnees (blob_plus, blob_minus, status, priority, target_file, etc.)"},
@@ -186,12 +293,12 @@ func toolDefinitions() []mcpToolDef {
 		},
 		{
 			Name:        "vault_todo_transition",
-			Description: "Change le statut d'un todo existant.",
+			Description: "Change le statut d'un todo ou d'une mission. Sur mission in_progress: verrouille les todos enfants. Sur mission done: deverrouille.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"id", "status"},
 				"properties": map[string]any{
-					"id":     map[string]any{"type": "number", "description": "ID du todo"},
+					"id":     map[string]any{"type": "number", "description": "ID du todo ou de la mission"},
 					"status": map[string]any{"type": "string", "description": "Nouveau statut", "enum": []string{"open", "in_progress", "blocked", "done"}},
 				},
 			},
@@ -256,6 +363,17 @@ func toolDefinitions() []mcpToolDef {
 				},
 			},
 		},
+		{
+			Name:        "vault_get_entity",
+			Description: "Lit une entite complete par son ID. Retourne tous les champs, meta JSON, relations et steps.",
+			InputSchema: map[string]any{
+				"type":     "object",
+				"required": []string{"id"},
+				"properties": map[string]any{
+					"id": map[string]any{"type": "number", "description": "ID de l'entite a lire"},
+				},
+			},
+		},
 	}
 }
 
@@ -281,6 +399,8 @@ func dispatchTool(srv *Server, name string, args json.RawMessage) mcpToolResult 
 		return srv.mcpAddSteps(args)
 	case "vault_step_done":
 		return srv.mcpStepDone(args)
+	case "vault_get_entity":
+		return srv.mcpGetEntity(args)
 	default:
 		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "unknown tool: " + name}}, IsError: true}
 	}
@@ -295,10 +415,13 @@ func (s *Server) mcpGetContext(args json.RawMessage) mcpToolResult {
 	}
 	json.Unmarshal(args, &p)
 
-	query := `SELECT type, label, meta->>'$.priority', meta->>'$.blob_plus'
+	query := `SELECT type, label, meta->>'$.priority', meta->>'$.blob_plus',
+		  meta->>'$.question', meta->>'$.blocking',
+		  datetime(ts_created, 'unixepoch'), datetime(ts_updated, 'unixepoch')
 		FROM entities
-		WHERE type IN ('todo','decision','constraint')
+		WHERE type IN ('todo','decision','constraint','checkpoint')
 		  AND (type != 'todo' OR meta->>'$.status' != 'done')
+		  AND (type != 'checkpoint' OR meta->>'$.answer' IS NULL)
 		  AND sensitivity < 2`
 	qargs := []any{}
 
@@ -312,7 +435,7 @@ func (s *Server) mcpGetContext(args json.RawMessage) mcpToolResult {
 	}
 
 	query += ` ORDER BY
-		CASE type WHEN 'todo' THEN 0 WHEN 'decision' THEN 1 WHEN 'constraint' THEN 2 END,
+		CASE type WHEN 'checkpoint' THEN -1 WHEN 'todo' THEN 0 WHEN 'decision' THEN 1 WHEN 'constraint' THEN 2 END,
 		CASE meta->>'$.priority' WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
 		ts_updated DESC
 		LIMIT 25`
@@ -323,20 +446,32 @@ func (s *Server) mcpGetContext(args json.RawMessage) mcpToolResult {
 	}
 	defer rows.Close()
 
-	var todos, decisions, constraints []string
+	var checkpoints, todos, decisions, constraints []string
 	for rows.Next() {
-		var typ, label, priority, blob string
-		if rows.Scan(&typ, &label, &priority, &blob) != nil {
+		var typ, label, priority, blob, question, blocking, created, updated sql.NullString
+		if rows.Scan(&typ, &label, &priority, &blob, &question, &blocking, &created, &updated) != nil {
 			continue
 		}
-		line := label
-		if priority != "" {
-			line = "[" + priority + "] " + line
+		line := label.String
+		if priority.Valid && priority.String != "" {
+			line = "[" + priority.String + "] " + line
 		}
-		if blob != "" {
-			line += " — " + blob
+		if blob.Valid && blob.String != "" {
+			line += " — " + blob.String
 		}
-		switch typ {
+		switch typ.String {
+		case "checkpoint":
+			cp := line
+			if question.Valid && question.String != "" {
+				cp += "\n    Question : " + question.String
+			}
+			if blocking.Valid && (blocking.String == "true" || blocking.String == "1") {
+				cp += "\n    Blocking : oui"
+			}
+			if created.Valid {
+				cp += "\n    Créé : " + created.String
+			}
+			checkpoints = append(checkpoints, cp)
 		case "todo":
 			todos = append(todos, line)
 		case "decision":
@@ -347,6 +482,12 @@ func (s *Server) mcpGetContext(args json.RawMessage) mcpToolResult {
 	}
 
 	var sb strings.Builder
+	if len(checkpoints) > 0 {
+		sb.WriteString("## CHECKPOINTS EN ATTENTE\n")
+		for _, c := range checkpoints {
+			sb.WriteString("- ⚠ " + c + "\n")
+		}
+	}
 	if len(todos) > 0 {
 		sb.WriteString("## Todos actifs\n")
 		for _, t := range todos {
@@ -390,7 +531,12 @@ func (s *Server) mcpSearchEntities(args json.RawMessage) mcpToolResult {
 		meta->>'$.priority' AS priority,
 		meta->>'$.blob_plus' AS blob_plus,
 		meta->>'$.target_file' AS target_file,
-		datetime(ts_updated, 'unixepoch') AS updated
+		datetime(ts_created, 'unixepoch') AS created,
+		datetime(ts_updated, 'unixepoch') AS updated,
+		meta->>'$.question' AS question,
+		meta->>'$.options' AS options,
+		meta->>'$.blocking' AS blocking,
+		meta->>'$.answer' AS answer
 		FROM entities WHERE sensitivity < 2`
 	qargs := []any{}
 
@@ -422,9 +568,10 @@ func (s *Server) mcpSearchEntities(args json.RawMessage) mcpToolResult {
 	var results []map[string]any
 	for rows.Next() {
 		var id int64
-		var ns, typ, label, status, priority, blobPlus, targetFile, updated sql.NullString
+		var ns, typ, label, status, priority, blobPlus, targetFile, created, updated sql.NullString
+		var question, options, blocking, answer sql.NullString
 		var sensitivity int
-		if rows.Scan(&id, &ns, &typ, &label, &sensitivity, &status, &priority, &blobPlus, &targetFile, &updated) != nil {
+		if rows.Scan(&id, &ns, &typ, &label, &sensitivity, &status, &priority, &blobPlus, &targetFile, &created, &updated, &question, &options, &blocking, &answer) != nil {
 			continue
 		}
 		row := map[string]any{"id": id}
@@ -450,8 +597,23 @@ func (s *Server) mcpSearchEntities(args json.RawMessage) mcpToolResult {
 		if targetFile.Valid && targetFile.String != "" {
 			row["target_file"] = targetFile.String
 		}
+		if created.Valid {
+			row["created"] = created.String
+		}
 		if updated.Valid {
 			row["updated"] = updated.String
+		}
+		if question.Valid && question.String != "" {
+			row["question"] = question.String
+		}
+		if options.Valid && options.String != "" {
+			row["options"] = options.String
+		}
+		if blocking.Valid && blocking.String != "" {
+			row["blocking"] = blocking.String
+		}
+		if answer.Valid && answer.String != "" {
+			row["answer"] = answer.String
 		}
 		results = append(results, row)
 	}
@@ -498,10 +660,26 @@ func (s *Server) mcpUpsertEntity(args json.RawMessage) mcpToolResult {
 	ctx := context.Background()
 
 	if p.ID != nil {
-		// Update
-		res, err := s.db.ExecContext(ctx,
-			`UPDATE entities SET label = ?, meta = jsonb(?), ts_updated = unixepoch() WHERE id = ?`,
-			p.Label, string(metaBlob), *p.ID)
+		// Update — merge meta via json_patch (RFC 7396): existing keys preserved,
+		// patch keys merged, null values delete the key.
+		// Also update namespace, type, sensitivity if provided.
+		query := `UPDATE entities SET label = ?, meta = jsonb(json_patch(json(meta), ?)),`
+		qargs := []any{p.Label, string(metaBlob)}
+		if p.Namespace != "" {
+			query += ` namespace = ?,`
+			qargs = append(qargs, p.Namespace)
+		}
+		if p.Type != "" {
+			query += ` type = ?,`
+			qargs = append(qargs, p.Type)
+		}
+		if p.Sensitivity > 0 {
+			query += ` sensitivity = ?,`
+			qargs = append(qargs, p.Sensitivity)
+		}
+		query += ` ts_updated = unixepoch() WHERE id = ?`
+		qargs = append(qargs, *p.ID)
+		res, err := s.db.ExecContext(ctx, query, qargs...)
 		if err != nil {
 			return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "update error: " + err.Error()}}, IsError: true}
 		}
@@ -517,8 +695,8 @@ func (s *Server) mcpUpsertEntity(args json.RawMessage) mcpToolResult {
 		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "namespace and type are required for create"}}, IsError: true}
 	}
 
-	// Auto-inject created_at timestamp for todos
-	if p.Type == "todo" {
+	// Auto-inject created_at timestamp for todos and missions
+	if p.Type == "todo" || p.Type == "mission" {
 		var metaMap map[string]any
 		if json.Unmarshal(metaBlob, &metaMap) == nil {
 			if _, exists := metaMap["created_at"]; !exists {
@@ -536,6 +714,34 @@ func (s *Server) mcpUpsertEntity(args json.RawMessage) mcpToolResult {
 		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "insert error: " + err.Error()}}, IsError: true}
 	}
 	id, _ := res.LastInsertId()
+
+	// Mission: auto-create subtask_of relations for each todo in meta.todos
+	if p.Type == "mission" {
+		var metaMap map[string]any
+		if json.Unmarshal(metaBlob, &metaMap) == nil {
+			if todosRaw, ok := metaMap["todos"]; ok {
+				if todosSlice, ok := todosRaw.([]any); ok {
+					for _, v := range todosSlice {
+						var todoID int64
+						switch n := v.(type) {
+						case float64:
+							todoID = int64(n)
+						case json.Number:
+							if i, err := n.Int64(); err == nil {
+								todoID = i
+							}
+						}
+						if todoID > 0 {
+							s.db.ExecContext(ctx,
+								`INSERT INTO relations (from_id, to_id, type, ts_created) VALUES (?, ?, 'subtask_of', unixepoch())`,
+								todoID, id)
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("created entity %d", id)}}}
 }
 
@@ -553,6 +759,49 @@ func (s *Server) mcpTodoTransition(args json.RawMessage) mcpToolResult {
 		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "invalid status: " + p.Status}}, IsError: true}
 	}
 
+	ctx := context.Background()
+
+	// Determine entity type (todo or mission)
+	var entityType string
+	err := s.db.QueryRowContext(ctx, `SELECT type FROM entities WHERE id = ? AND type IN ('todo','mission')`, p.ID).Scan(&entityType)
+	if err != nil {
+		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("todo %d not found (or not a todo/mission)", p.ID)}}, IsError: true}
+	}
+
+	// Lock check: if this todo has meta.locked_by, verify session matches the mission's session
+	if entityType == "todo" && p.Status == "in_progress" {
+		var metaRaw string
+		s.db.QueryRowContext(ctx, `SELECT json(meta) FROM entities WHERE id = ?`, p.ID).Scan(&metaRaw)
+		var metaMap map[string]any
+		if json.Unmarshal([]byte(metaRaw), &metaMap) == nil {
+			if lockedByRaw, ok := metaMap["locked_by"]; ok {
+				var missionID int64
+				switch n := lockedByRaw.(type) {
+				case float64:
+					missionID = int64(n)
+				case json.Number:
+					if i, err := n.Int64(); err == nil {
+						missionID = i
+					}
+				}
+				if missionID > 0 {
+					// Read mission's assigned_session
+					var missionMeta string
+					s.db.QueryRowContext(ctx, `SELECT json(meta) FROM entities WHERE id = ?`, missionID).Scan(&missionMeta)
+					var mm map[string]any
+					if json.Unmarshal([]byte(missionMeta), &mm) == nil {
+						if assignedSession, ok := mm["assigned_session"].(string); ok && assignedSession != "" {
+							currentSess := s.currentSession()
+							if currentSess != assignedSession {
+								return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("todo #%d verrouillée par mission #%d (session %s)", p.ID, missionID, assignedSession)}}, IsError: true}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Set status + horodatage de la transition dans meta JSONB.
 	now := `"` + time.Now().UTC().Format(time.RFC3339) + `"`
 	statusVal := `"` + p.Status + `"`
@@ -560,28 +809,73 @@ func (s *Server) mcpTodoTransition(args json.RawMessage) mcpToolResult {
 	var query string
 	switch p.Status {
 	case "in_progress":
-		query = `UPDATE entities SET meta = jsonb_set(jsonb_set(meta, '$.status', jsonb(?)), '$.started_at', jsonb(?)), ts_updated = unixepoch() WHERE id = ? AND type = 'todo'`
+		query = `UPDATE entities SET meta = jsonb_set(jsonb_set(meta, '$.status', jsonb(?)), '$.started_at', jsonb(?)), ts_updated = unixepoch() WHERE id = ?`
 	case "done":
-		query = `UPDATE entities SET meta = jsonb_set(jsonb_set(meta, '$.status', jsonb(?)), '$.completed_at', jsonb(?)), ts_updated = unixepoch() WHERE id = ? AND type = 'todo'`
+		query = `UPDATE entities SET meta = jsonb_set(jsonb_set(meta, '$.status', jsonb(?)), '$.completed_at', jsonb(?)), ts_updated = unixepoch() WHERE id = ?`
 	default:
-		query = `UPDATE entities SET meta = jsonb_set(meta, '$.status', jsonb(?)), ts_updated = unixepoch() WHERE id = ? AND type = 'todo'`
+		query = `UPDATE entities SET meta = jsonb_set(meta, '$.status', jsonb(?)), ts_updated = unixepoch() WHERE id = ?`
 	}
 
 	var res sql.Result
-	var err error
 	if p.Status == "in_progress" || p.Status == "done" {
-		res, err = s.db.ExecContext(context.Background(), query, statusVal, now, p.ID)
+		res, err = s.db.ExecContext(ctx, query, statusVal, now, p.ID)
 	} else {
-		res, err = s.db.ExecContext(context.Background(), query, statusVal, p.ID)
+		res, err = s.db.ExecContext(ctx, query, statusVal, p.ID)
 	}
 	if err != nil {
 		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "update error: " + err.Error()}}, IsError: true}
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("todo %d not found (or not a todo)", p.ID)}}, IsError: true}
+		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("todo %d not found (or not a todo/mission)", p.ID)}}, IsError: true}
 	}
+
+	// Mission cascading: lock/unlock child todos
+	if entityType == "mission" {
+		childIDs := s.missionChildIDs(ctx, p.ID)
+		switch p.Status {
+		case "in_progress":
+			// Record assigned_session + lock children
+			sess := s.currentSession()
+			s.db.ExecContext(ctx,
+				`UPDATE entities SET meta = jsonb_set(meta, '$.assigned_session', jsonb(?)) WHERE id = ?`,
+				`"`+sess+`"`, p.ID)
+			for _, cid := range childIDs {
+				s.db.ExecContext(ctx,
+					`UPDATE entities SET meta = jsonb_set(meta, '$.locked_by', jsonb(?)) WHERE id = ?`,
+					fmt.Sprintf("%d", p.ID), cid)
+			}
+		case "done":
+			// Unlock children: remove locked_by
+			for _, cid := range childIDs {
+				s.db.ExecContext(ctx,
+					`UPDATE entities SET meta = jsonb_remove(meta, '$.locked_by') WHERE id = ?`, cid)
+			}
+			// Clear assigned_session
+			s.db.ExecContext(ctx,
+				`UPDATE entities SET meta = jsonb_remove(meta, '$.assigned_session') WHERE id = ?`, p.ID)
+		}
+	}
+
 	return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("todo %d -> %s", p.ID, p.Status)}}}
+}
+
+// missionChildIDs returns the IDs of todos linked to a mission via subtask_of.
+func (s *Server) missionChildIDs(ctx context.Context, missionID int64) []int64 {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT from_id FROM relations WHERE to_id = ? AND type = 'subtask_of'`, missionID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 func (s *Server) mcpListTodos(args json.RawMessage) mcpToolResult {
@@ -597,7 +891,9 @@ func (s *Server) mcpListTodos(args json.RawMessage) mcpToolResult {
 		meta->>'$.priority' AS priority,
 		meta->>'$.deadline' AS deadline,
 		meta->>'$.blob_plus' AS description,
-		GROUP_CONCAT(r.to_id) AS blockers
+		GROUP_CONCAT(r.to_id) AS blockers,
+		datetime(e.ts_created, 'unixepoch') AS created,
+		datetime(e.ts_updated, 'unixepoch') AS updated
 		FROM entities e
 		LEFT JOIN relations r ON r.from_id = e.id AND r.type = 'depends_on'
 		WHERE e.type = 'todo'`
@@ -630,8 +926,8 @@ func (s *Server) mcpListTodos(args json.RawMessage) mcpToolResult {
 	count := 0
 	for rows.Next() {
 		var id int64
-		var label, status, priority, deadline, description, blockers sql.NullString
-		if rows.Scan(&id, &label, &status, &priority, &deadline, &description, &blockers) != nil {
+		var label, status, priority, deadline, description, blockers, created, updated sql.NullString
+		if rows.Scan(&id, &label, &status, &priority, &deadline, &description, &blockers, &created, &updated) != nil {
 			continue
 		}
 		count++
@@ -651,7 +947,15 @@ func (s *Server) mcpListTodos(args json.RawMessage) mcpToolResult {
 		if blockers.Valid && blockers.String != "" {
 			bl = " blocked by: " + blockers.String
 		}
-		sb.WriteString(fmt.Sprintf("#%d %s%s — %s%s%s\n", id, label.String, pri, st, dl, bl))
+		ts := ""
+		if created.Valid {
+			ts = " (créé " + created.String
+			if updated.Valid && updated.String != created.String {
+				ts += ", maj " + updated.String
+			}
+			ts += ")"
+		}
+		sb.WriteString(fmt.Sprintf("#%d %s%s — %s%s%s%s\n", id, label.String, pri, st, dl, bl, ts))
 		if description.Valid && description.String != "" {
 			sb.WriteString("   " + description.String + "\n")
 		}
@@ -724,6 +1028,14 @@ func (s *Server) mcpDeleteEntity(args json.RawMessage) mcpToolResult {
 	return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("deleted entity %d", p.ID)}}}
 }
 
+// stepKey extracts the dedup key from a step name: prefix before ':' (trimmed), or the full name.
+func stepKey(step string) string {
+	if i := strings.IndexByte(step, ':'); i > 0 {
+		return strings.TrimSpace(step[:i])
+	}
+	return step
+}
+
 func (s *Server) mcpAddSteps(args json.RawMessage) mcpToolResult {
 	var p struct {
 		TodoID int64    `json:"todo_id"`
@@ -751,8 +1063,9 @@ func (s *Server) mcpAddSteps(args json.RawMessage) mcpToolResult {
 		if step == "" {
 			continue
 		}
+		key := stepKey(step)
 		res, err := s.db.ExecContext(ctx,
-			`INSERT OR IGNORE INTO todo_steps (todo_id, step) VALUES (?, ?)`, p.TodoID, step)
+			`INSERT OR IGNORE INTO todo_steps (todo_id, step, step_key) VALUES (?, ?, ?)`, p.TodoID, step, key)
 		if err != nil {
 			return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "insert error: " + err.Error()}}, IsError: true}
 		}
@@ -773,10 +1086,11 @@ func (s *Server) mcpStepDone(args json.RawMessage) mcpToolResult {
 
 	ctx := context.Background()
 
-	// Mark step done
+	// Mark step done — match on step_key (short prefix before ':')
+	key := stepKey(strings.TrimSpace(p.Step))
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE todo_steps SET done = 1, done_at = unixepoch() WHERE todo_id = ? AND step = ? AND done = 0`,
-		p.TodoID, p.Step)
+		`UPDATE todo_steps SET done = 1, done_at = unixepoch() WHERE todo_id = ? AND step_key = ? AND done = 0`,
+		p.TodoID, key)
 	if err != nil {
 		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "update error: " + err.Error()}}, IsError: true}
 	}
@@ -785,7 +1099,7 @@ func (s *Server) mcpStepDone(args json.RawMessage) mcpToolResult {
 		// Check if step exists but already done
 		var exists int
 		s.db.QueryRowContext(ctx,
-			`SELECT 1 FROM todo_steps WHERE todo_id = ? AND step = ?`, p.TodoID, p.Step).Scan(&exists)
+			`SELECT 1 FROM todo_steps WHERE todo_id = ? AND step_key = ?`, p.TodoID, key).Scan(&exists)
 		if exists == 1 {
 			return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("step already done: %s", p.Step)}}}
 		}
@@ -808,4 +1122,95 @@ func (s *Server) mcpStepDone(args json.RawMessage) mcpToolResult {
 	}
 
 	return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("step done: %s — %d required steps remaining", p.Step, remaining)}}}
+}
+
+func (s *Server) mcpGetEntity(args json.RawMessage) mcpToolResult {
+	var p struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(args, &p); err != nil {
+		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: "invalid params: " + err.Error()}}, IsError: true}
+	}
+
+	ctx := context.Background()
+
+	var ns, typ, label, sessionOrigin sql.NullString
+	var sensitivity int
+	var meta sql.NullString
+	var created, updated sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT namespace, type, label, sensitivity, json(meta),
+			datetime(ts_created, 'unixepoch'), datetime(ts_updated, 'unixepoch'),
+			session_origin
+		FROM entities WHERE id = ?`, p.ID).Scan(
+		&ns, &typ, &label, &sensitivity, &meta, &created, &updated, &sessionOrigin)
+	if err != nil {
+		return mcpToolResult{Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("entity %d not found", p.ID)}}, IsError: true}
+	}
+
+	result := map[string]any{"id": p.ID}
+	if ns.Valid {
+		result["namespace"] = ns.String
+	}
+	if typ.Valid {
+		result["type"] = typ.String
+	}
+	if label.Valid {
+		result["label"] = label.String
+	}
+	result["sensitivity"] = sensitivity
+	if meta.Valid {
+		var m any
+		if json.Unmarshal([]byte(meta.String), &m) == nil {
+			result["meta"] = m
+		}
+	}
+	if created.Valid {
+		result["created"] = created.String
+	}
+	if updated.Valid {
+		result["updated"] = updated.String
+	}
+	if sessionOrigin.Valid {
+		result["session_origin"] = sessionOrigin.String
+	}
+
+	// Relations
+	relRows, err := s.db.QueryContext(ctx,
+		`SELECT type, from_id, to_id FROM relations WHERE from_id = ? OR to_id = ?`, p.ID, p.ID)
+	if err == nil {
+		var rels []map[string]any
+		for relRows.Next() {
+			var rType string
+			var fromID, toID int64
+			if relRows.Scan(&rType, &fromID, &toID) == nil {
+				rels = append(rels, map[string]any{"type": rType, "from_id": fromID, "to_id": toID})
+			}
+		}
+		relRows.Close()
+		if len(rels) > 0 {
+			result["relations"] = rels
+		}
+	}
+
+	// Steps
+	stepRows, err := s.db.QueryContext(ctx,
+		`SELECT step, done, required FROM todo_steps WHERE todo_id = ? ORDER BY rowid`, p.ID)
+	if err == nil {
+		var steps []map[string]any
+		for stepRows.Next() {
+			var step string
+			var done, required int
+			if stepRows.Scan(&step, &done, &required) == nil {
+				steps = append(steps, map[string]any{"step": step, "done": done == 1, "required": required == 1})
+			}
+		}
+		stepRows.Close()
+		if len(steps) > 0 {
+			result["steps"] = steps
+		}
+	}
+
+	b, _ := json.MarshalIndent(result, "", "  ")
+	return mcpToolResult{Content: []mcpContent{{Type: "text", Text: string(b)}}}
 }
