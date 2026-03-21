@@ -73,12 +73,14 @@ func newDaemon(db *sql.DB) *daemon {
 	return d
 }
 
+// CLAUDE:WARN takes mu.Lock — mutates d.clients map.
 func (d *daemon) addClient(conn net.Conn, info *clientInfo) {
 	d.mu.Lock()
 	d.clients[conn] = info
 	d.mu.Unlock()
 }
 
+// CLAUDE:WARN takes mu.Lock — deletes from d.clients, writes DB (agents SET connected=0). Triggers checkNoSupervisor broadcast if supervisor disconnects.
 func (d *daemon) removeClient(conn net.Conn) {
 	d.mu.Lock()
 	info := d.clients[conn]
@@ -275,6 +277,7 @@ func (d *daemon) callTool(req *jsonrpcRequest, fn func(json.RawMessage) vault.Re
 	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: r}, nil
 }
 
+// CLAUDE:WARN takes mu.Lock — mutates info.sessionID and info.role. Writes DB (INSERT/UPDATE agents). Restores role from agents table on reconnect — requested role may differ from effective role. Post-action pushes notify/role_restored.
 func (d *daemon) handleRegister(req *jsonrpcRequest, info *clientInfo) (*jsonrpcResponse, []func()) {
 	var p struct {
 		SessionID string `json:"session_id"`
@@ -324,6 +327,7 @@ func (d *daemon) handleRegister(req *jsonrpcRequest, info *clientInfo) (*jsonrpc
 	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]string{"status": "registered", "role": effectiveRole}}, post
 }
 
+// CLAUDE:WARN takes mu.Lock (held for full duration) — supervisor singleton enforced via agents table. Disconnects old session_id from agents on session change. Post-action triggers checkNoSupervisor on downgrade.
 func (d *daemon) handleAssumeRole(req *jsonrpcRequest, info *clientInfo) (*jsonrpcResponse, []func()) {
 	var p struct {
 		Role      string `json:"role"`
@@ -416,6 +420,7 @@ func (d *daemon) checkNoSupervisor() {
 
 // ── Checkpoint watcher ───────────────────────────────────────────────────────
 
+// CLAUDE:WARN launches as goroutine — polls vault.db every 3s. notifiedCreated/notifiedAnswered maps grow unbounded (no eviction). Watermarks based on unix timestamps, not row IDs.
 func (d *daemon) watchCheckpoints(ctx context.Context) {
 	answeredWM := time.Now().Unix() - 1
 	createdWM := time.Now().Unix() - 1
@@ -474,8 +479,7 @@ func (d *daemon) watchCheckpoints(ctx context.Context) {
 	}
 }
 
-// pushToSession sends a notification to all clients with the given session ID.
-// If session is empty, broadcasts to all clients.
+// CLAUDE:WARN takes mu.RLock — writes to client connections (enc.Encode). If session is empty, broadcasts to ALL clients. Silent on encode errors (logs but continues).
 func (d *daemon) pushToSession(session, method string, params map[string]any) {
 	notif := map[string]any{"jsonrpc": "2.0", "method": method, "params": params}
 	d.mu.RLock()
@@ -489,7 +493,7 @@ func (d *daemon) pushToSession(session, method string, params map[string]any) {
 	}
 }
 
-// pushToRole sends a notification to all clients with the given role.
+// CLAUDE:WARN takes mu.RLock — writes to client connections (enc.Encode). Iterates all clients, sends to matching role. Silent on encode errors.
 func (d *daemon) pushToRole(role, method string, params map[string]any) {
 	notif := map[string]any{"jsonrpc": "2.0", "method": method, "params": params}
 	d.mu.RLock()

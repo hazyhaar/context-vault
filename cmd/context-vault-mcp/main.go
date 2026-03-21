@@ -91,6 +91,7 @@ type daemonConn struct {
 	closed chan struct{}         // closed when read goroutine exits
 }
 
+// CLAUDE:WARN retries 3 times with 500ms sleep — blocks caller up to 1.5s on daemon unreachable. Returns net.Conn that must be closed by caller.
 func dialDaemon(addr string) (*daemonConn, error) {
 	var conn net.Conn
 	var err error
@@ -118,10 +119,7 @@ func dialDaemon(addr string) (*daemonConn, error) {
 
 const callTimeout = 10 * time.Second
 
-// startMux launches a read goroutine that continuously reads from the TCP connection.
-// Messages with an id field are routed to respCh (responses).
-// Messages without id (notifications, method notify/*) are forwarded via onNotif.
-// When the connection closes, the closed channel is closed.
+// CLAUDE:WARN launches goroutine — demuxes TCP stream into responses (respCh) and notifications (onNotif callback). Closes dc.closed and dc.respCh on disconnect — callDaemon detects this via select.
 func (dc *daemonConn) startMux(onNotif func(jsonrpcNotification)) {
 	dc.respCh = make(chan *jsonrpcResponse, 16)
 	dc.closed = make(chan struct{})
@@ -173,9 +171,7 @@ func (dc *daemonConn) startMux(onNotif func(jsonrpcNotification)) {
 	}()
 }
 
-// callDaemon sends a JSON-RPC request to the daemon and returns the response.
-// Pre-mux: reads synchronously from scanner (used for register before mux starts).
-// Post-mux: sends request and waits on respCh with timeout.
+// CLAUDE:WARN takes mu.Lock — two modes: pre-mux (synchronous read, blocks on scanner) and post-mux (sends then waits on respCh with 10s timeout). All requests use ID=1 — no concurrent request pipelining.
 func (dc *daemonConn) callDaemon(method string, params json.RawMessage) (*jsonrpcResponse, error) {
 	dc.mu.Lock()
 

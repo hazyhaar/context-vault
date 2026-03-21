@@ -1,11 +1,11 @@
 # context-vault — Usage des outils MCP
 
-7 outils disponibles via le serveur MCP stdio. Tous opèrent sur `$PROJECT_DIR/.claude/vault.db`.
+10 outils disponibles via le serveur MCP stdio. Tous opèrent sur `$PROJECT_DIR/.claude/vault.db`.
 
 ## Concepts
 
 - **namespace** : regroupe les entités par projet/service (ex: `repvow`, `horum`, `infra`)
-- **type** : `todo`, `decision`, `constraint`, `pattern`, `function`, `type`, `package`, `file`, `api`, `dependency`, `credential`
+- **type** : `todo`, `mission`, `decision`, `constraint`, `checkpoint`, `pattern`, `function`, `type`, `package`, `file`, `api`, `dependency`, `credential`
 - **meta** : blob JSON libre. Clés conventionnelles : `status`, `priority`, `blob_plus`, `blob_minus`, `target_file`, `deadline`
 - **sensitivity** : `0` public, `1` internal, `2` secret (exclu des résultats sauf delete)
 
@@ -152,3 +152,53 @@ vault_delete_entity({"id": 45})
 **Fin de tâche** : `vault_todo_transition` pour marquer les todos done, créer les nouveaux todos pour la suite.
 
 **Après compaction** : `vault_get_context` est automatiquement injecté par le hook — les décisions et todos survivent à la perte de contexte.
+
+## vault_add_steps
+
+Ajoute des étapes à un todo existant. INSERT OR IGNORE — idempotent.
+
+```
+vault_add_steps({
+  "todo_id": 43,
+  "steps": ["écrire le test", "vérifier la CI", "merger"]
+})
+→ added 3 steps to todo 43
+```
+
+## vault_step_done
+
+Marque une étape comme terminée. Auto-transition du todo si toutes les étapes required sont done.
+
+```
+vault_step_done({"todo_id": 43, "step": "écrire le test"})
+→ step done: écrire le test (1/3 done)
+```
+
+## vault_get_entity
+
+Lit une entité complète par ID — meta, relations, steps.
+
+```
+vault_get_entity({"id": 43})
+→ #43 todo [high] — Ajouter goleak_test.go
+  Relations: depends_on #42
+  Steps: [x] écrire le test [ ] vérifier la CI [ ] merger
+```
+
+## vault_list_workers
+
+Liste les clients connectés au daemon (superviseur uniquement).
+
+```
+vault_list_workers({})
+→ {"workers": [{"session_id": "abc-123", "role": "supervisor"}, {"session_id": "def-456", "role": "worker"}]}
+```
+
+## vault_assume_role
+
+Change le rôle de la session (worker/supervisor). Un seul superviseur actif à la fois.
+
+```
+vault_assume_role({"role": "supervisor", "session_id": "uuid-stable"})
+→ {"status": "role_changed", "role": "supervisor"}
+```
