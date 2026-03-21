@@ -22,11 +22,9 @@ context-vault/
 │   ├── vault.go                Business logic — 16 opérations vault
 │   ├── schema.go               DDL vault.db + migrations
 │   └── types.go                Result, Content — types retour MCP-indépendants
-├── skills/
-│   ├── session-code/SKILL.md   Orchestration dev (pick→steps→code→test→done)
-│   └── supervisor/SKILL.md     Supervision multi-terminaux
-└── scripts/
-    └── run.sh                  SessionStart launcher (legacy)
+└── skills/
+    ├── session-code/SKILL.md   Orchestration dev (pick→steps→code→test→done)
+    └── supervisor/SKILL.md     Supervision multi-terminaux
 ```
 
 ## Architecture
