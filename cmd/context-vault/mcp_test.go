@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hazyhaar/context-vault/internal/vault"
 	_ "modernc.org/sqlite"
 )
 
@@ -20,7 +21,9 @@ func testServer(t *testing.T) *Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	return &Server{db: db, rings: make(map[string]*RingDumper)}
+	srv := &Server{db: db, rings: make(map[string]*RingDumper)}
+	srv.vault = vault.New(db, srv.currentSession)
+	return srv
 }
 
 // call is a shorthand to call an MCP handler with JSON args and return the text result.
