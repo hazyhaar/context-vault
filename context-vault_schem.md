@@ -1,216 +1,250 @@
 # context-vault — Technical Schema
 
-**HTTP hooks server — persists Claude Code session events to SQLite JSONB.**
+**Daemon TCP mémoire persistante inter-sessions pour Claude Code.**
 
 Module: `github.com/hazyhaar/context-vault`
-Go: 1.21 | Deps: modernc.org/sqlite | CGO_ENABLED=0
-Binary: `cmd/context-vault` — listens on localhost:9742
+Go: 1.25 | Deps: modernc.org/sqlite | CGO_ENABLED=0
+Binaires: `cmd/context-vault-daemon` (TCP:9743), `cmd/context-vault-mcp` (MCP stdio)
 
 ## Arborescence
 
 ```
 context-vault/
-├── cmd/context-vault/
-│   └── main.go              Server, RingDumper, handlers, schema
-├── scripts/
-│   └── run.sh               SessionStart launcher (health check + bg start)
+├── cmd/
+│   ├── context-vault-daemon/
+│   │   └── main.go             Daemon TCP, client tracking, checkpoint watcher
+│   ├── context-vault-mcp/
+│   │   └── main.go             Thin client MCP stdio, TCP proxy, fallback SQLite
+│   └── context-vault/
+│       ├── main.go             Legacy HTTP hooks server (deprecated)
+│       └── mcp.go              Legacy MCP monolithique (deprecated)
+├── internal/vault/
+│   ├── vault.go                Business logic — 16 opérations vault
+│   ├── schema.go               DDL vault.db + migrations
+│   └── types.go                Result, Content — types retour MCP-indépendants
 ├── skills/
-│   ├── prends-note/SKILL.md  LLM-initiated entity persistence
-│   ├── hot-contexte/SKILL.md Targeted SELECT before compaction
-│   └── project-mgmt/SKILL.md Structured todos with dependencies
-└── .claude/commands/
-    └── note.md               /note user command
+│   ├── session-code/SKILL.md   Orchestration dev (pick→steps→code→test→done)
+│   └── supervisor/SKILL.md     Supervision multi-terminaux
+└── scripts/
+    └── run.sh                  SessionStart launcher (legacy)
 ```
 
 ## Architecture
 
 ```
-╔══════════════════════════════════════════════════════════╗
-║                    Claude Code                           ║
-║  hooks: SessionStart, UserPromptSubmit, PostToolUse,     ║
-║         PostToolUseFailure, Stop, PreCompact,            ║
-║         SessionEnd, Setup                                ║
-╚═══════════════════════╤══════════════════════════════════╝
-                        │ HTTP POST localhost:9742
-                        ▼
-╔══════════════════════════════════════════════════════════╗
-║                      Server                              ║
-║                                                          ║
-║  db         *sql.DB     (MaxOpenConns=1)                 ║
-║  ring       *RingDumper (circular buffer, 10 entries)    ║
-║  sessionID  string      (guarded by mu)                  ║
-╠══════════════════════════════════════════════════════════╣
-║  /hook/session-start  → INSERT sessions + body: context  ║
-║  /hook/user-prompt    → INSERT buffer + body: signal     ║
-║  /hook/post-tool      → INSERT buffer                    ║
-║  /hook/post-tool-fail → INSERT buffer                    ║
-║  /hook/stop           → INSERT buffer                    ║
-║  /hook/pre-compact    → INSERT buffer + compact_log      ║
-║  /hook/session-end    → UPDATE sessions.ended_at         ║
-║  /hook/setup          → PRAGMA optimize + VACUUM         ║
-║  /health              → 200 OK                           ║
-╚═══════════════╤════════════════════╤═════════════════════╝
-                │                    │
-                ▼                    ▼
-╔═══════════════════════╗  ╔════════════════════════════╗
-║     RingDumper        ║  ║  HTTP response body        ║
-║                       ║  ║  (injected by Claude Code) ║
-║  buf [10]entry        ║  ║                            ║
-║  head, total int      ║  ║  SessionStart:             ║
-║  mu sync.Mutex        ║  ║    types summary, todos,   ║
-║                       ║  ║    constraints              ║
-║  Push() → evict+add   ║  ║                            ║
-║  ShouldSignal()       ║  ║  UserPromptSubmit:         ║
-║    total/4 > 2000     ║  ║    "[vault] ~N tokens"     ║
-╚═══════════════════════╝  ╚════════════════════════════╝
+┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐
+│  Claude Code    │   │  Claude Code    │   │  Claude Code    │
+│  (supervisor)   │   │  (worker 1)     │   │  (worker 2)     │
+└────────┬────────┘   └────────┬────────┘   └────────┬────────┘
+         │ stdio               │ stdio               │ stdio
+┌────────▼────────┐   ┌────────▼────────┐   ┌────────▼────────┐
+│  thin client    │   │  thin client    │   │  thin client    │
+│  -role supvsr   │   │  -role worker   │   │  -role worker   │
+│  -channel       │   │  -channel       │   │  -channel       │
+└────────┬────────┘   └────────┬────────┘   └────────┬────────┘
+         │ TCP:9743            │ TCP:9743            │ TCP:9743
+         └────────────┬────────┴────────────┬────────┘
+                      │                     │
+              ╔═══════▼═════════════════════▼═══════╗
+              ║          daemon                     ║
+              ║                                     ║
+              ║  mu sync.RWMutex                    ║
+              ║  clients map[net.Conn]*clientInfo    ║
+              ║  v *vault.Vault                     ║
+              ║                                     ║
+              ║  ┌──────────────────────────────┐   ║
+              ║  │ watchCheckpoints (goroutine)  │   ║
+              ║  │ poll 3s → pushToRole/Session  │   ║
+              ║  └──────────────────────────────┘   ║
+              ║                                     ║
+              ║  ┌──────────────────────────────┐   ║
+              ║  │ WAL checkpoint (goroutine)    │   ║
+              ║  │ PASSIVE every 2min            │   ║
+              ║  └──────────────────────────────┘   ║
+              ╚═══════════════╤═════════════════════╝
+                              │ SQL
+                      ╔═══════▼═══════╗
+                      ║   vault.db    ║
+                      ║   SQLite WAL  ║
+                      ╚═══════════════╝
 ```
 
-## Schéma de données
+## Thin client — TCP mux
+
+```
+stdin (Claude Code)                     TCP conn (daemon)
+      │                                       │
+      │  JSON-RPC request                     │
+      ├──────────────────────────────────────▶│
+      │                                       │
+      │                          ┌────────────┤
+      │                          │ startMux   │
+      │                          │ goroutine  │
+      │                          └────┬───────┘
+      │                               │
+      │  ◀── response (has id) ───────┤ respCh
+      │  ◀── notification (no id) ────┤ onNotif → MCP channel event
+      │                               │
+      ▼                               ▼
+stdout (MCP response / channel)   dc.closed on disconnect
+```
+
+Fallback : si daemon injoignable → `openFallbackVault()` → SQLite direct (sans push).
+
+## Schéma de données (vault.db)
 
 ```
 ╔══════════════════════════════════════════════════════════╗
-║  TABLE: sessions                                         ║
-╠═══════════════╤═══════════╤══════════════════════════════╣
-║  id           │ TEXT      │ PK                           ║
-║  started_at   │ INTEGER   │ NOT NULL, unix epoch         ║
-║  ended_at     │ INTEGER   │ set on SessionEnd            ║
-║  project      │ TEXT      │ project directory            ║
-║  model        │ TEXT      │ Claude model used            ║
-╚═══════════════╧═══════════╧══════════════════════════════╝
+║  TABLE: entities                                        ║
+╠════════════════╤════════════╤════════════════════════════╣
+║  id            │ INTEGER    │ PRIMARY KEY                ║
+║  namespace     │ TEXT       │ NOT NULL                   ║
+║  type          │ TEXT       │ NOT NULL                   ║
+║  label         │ TEXT       │ NOT NULL                   ║
+║  sensitivity   │ INTEGER    │ DEFAULT 0 (0/1/2)         ║
+║  ts_created    │ INTEGER    │ NOT NULL (unix)            ║
+║  ts_updated    │ INTEGER    │ NOT NULL (unix)            ║
+║  session_origin│ TEXT       │ session qui a créé         ║
+║  meta          │ BLOB       │ JSONB (status, priority…) ║
+╚════════════════╧════════════╧════════════════════════════╝
 
 ╔══════════════════════════════════════════════════════════╗
-║  TABLE: entities                                         ║
-╠═══════════════╤═══════════╤══════════════════════════════╣
-║  id           │ INTEGER   │ PK                           ║
-║  namespace    │ TEXT      │ NOT NULL                     ║
-║  type         │ TEXT      │ NOT NULL (function, todo...) ║
-║  label        │ TEXT      │ NOT NULL                     ║
-║  sensitivity  │ INTEGER   │ DEFAULT 0 (2=excluded)       ║
-║  ts_created   │ INTEGER   │ NOT NULL                     ║
-║  ts_updated   │ INTEGER   │ NOT NULL                     ║
-║  session_origin│ TEXT     │ session that created it      ║
-║  meta         │ BLOB      │ JSONB (blob_plus, status...) ║
-╚═══════════════╧═══════════╧══════════════════════════════╝
-  IDX: (namespace, type), (ts_updated DESC)
+║  TABLE: relations                                       ║
+╠════════════════╤════════════╤════════════════════════════╣
+║  id            │ INTEGER    │ PRIMARY KEY                ║
+║  from_id       │ INTEGER    │ FK entities ON DELETE CASC ║
+║  to_id         │ INTEGER    │ FK entities ON DELETE CASC ║
+║  type          │ TEXT       │ depends_on/blocks/subtask  ║
+║  ts_created    │ INTEGER    │ NOT NULL                   ║
+╚════════════════╧════════════╧════════════════════════════╝
 
 ╔══════════════════════════════════════════════════════════╗
-║  TABLE: relations                                        ║
-╠═══════════════╤═══════════╤══════════════════════════════╣
-║  id           │ INTEGER   │ PK                           ║
-║  from_id      │ INTEGER   │ FK → entities ON DELETE CASC ║
-║  to_id        │ INTEGER   │ FK → entities ON DELETE CASC ║
-║  type         │ TEXT      │ NOT NULL (depends_on, etc.)  ║
-║  ts_created   │ INTEGER   │ NOT NULL                     ║
-╚═══════════════╧═══════════╧══════════════════════════════╝
-  IDX: (from_id), (to_id)
+║  TABLE: todo_steps                                      ║
+╠════════════════╤════════════╤════════════════════════════╣
+║  todo_id       │ INTEGER    │ FK entities ON DELETE CASC ║
+║  step          │ TEXT       │ NOT NULL                   ║
+║  step_key      │ TEXT       │ NOT NULL (dedup key)       ║
+║  required      │ INTEGER    │ DEFAULT 1                  ║
+║  done          │ INTEGER    │ DEFAULT 0                  ║
+║  done_at       │ INTEGER    │                            ║
+║  PRIMARY KEY (todo_id, step_key)                        ║
+╚════════════════╧════════════╧════════════════════════════╝
 
 ╔══════════════════════════════════════════════════════════╗
-║  TABLE: buffer                                           ║
-╠═══════════════╤═══════════╤══════════════════════════════╣
-║  id           │ INTEGER   │ PK                           ║
-║  session_id   │ TEXT      │ NOT NULL                     ║
-║  ts           │ INTEGER   │ NOT NULL                     ║
-║  hook         │ TEXT      │ NOT NULL (event type)        ║
-║  payload      │ BLOB      │ NOT NULL, raw JSONB          ║
-║  size_est     │ INTEGER   │ NOT NULL, byte estimate      ║
-║  processed    │ INTEGER   │ DEFAULT 0                    ║
-╚═══════════════╧═══════════╧══════════════════════════════╝
-  IDX: (session_id, processed, ts)
+║  TABLE: agents                                          ║
+╠════════════════╤════════════╤════════════════════════════╣
+║  session_id    │ TEXT       │ PRIMARY KEY                ║
+║  role          │ TEXT       │ DEFAULT 'worker'           ║
+║  connected     │ INTEGER    │ 0/1                        ║
+║  registered_at │ INTEGER    │ NOT NULL (unix)            ║
+║  last_seen_at  │ INTEGER    │ NOT NULL (unix)            ║
+╚════════════════╧════════════╧════════════════════════════╝
 
 ╔══════════════════════════════════════════════════════════╗
-║  TABLE: compact_log                                      ║
-╠═══════════════╤═══════════╤══════════════════════════════╣
-║  id           │ INTEGER   │ PK                           ║
-║  ts           │ INTEGER   │ NOT NULL                     ║
-║  session_id   │ TEXT      │ NOT NULL                     ║
-║  trigger      │ TEXT      │ auto / manual                ║
-║  reasoning    │ TEXT      │ hot-contexte step 1 output   ║
-║  query_used   │ TEXT      │ SELECT executed              ║
-║  result_text  │ TEXT      │ extracted context             ║
-╚═══════════════╧═══════════╧══════════════════════════════╝
+║  TABLE: buffer  (legacy — HTTP hooks)                   ║
+╠════════════════╤════════════╤════════════════════════════╣
+║  id            │ INTEGER    │ PRIMARY KEY                ║
+║  session_id    │ TEXT       │ NOT NULL                   ║
+║  ts            │ INTEGER    │ NOT NULL                   ║
+║  hook          │ TEXT       │ NOT NULL                   ║
+║  payload       │ BLOB       │ NOT NULL (JSONB)           ║
+║  size_est      │ INTEGER    │ NOT NULL                   ║
+║  processed     │ INTEGER    │ DEFAULT 0                  ║
+╚════════════════╧════════════╧════════════════════════════╝
+
+╔══════════════════════════════════════════════════════════╗
+║  TABLE: sessions  (legacy — HTTP hooks)                 ║
+╠════════════════╤════════════╤════════════════════════════╣
+║  id            │ TEXT       │ PRIMARY KEY                ║
+║  started_at    │ INTEGER    │ NOT NULL                   ║
+║  ended_at      │ INTEGER    │                            ║
+║  project       │ TEXT       │                            ║
+║  model         │ TEXT       │                            ║
+╚════════════════╧════════════╧════════════════════════════╝
 ```
 
-## Flux de données
-
-### Hook ingestion (every event)
+## Flux — checkpoint routing
 
 ```
-Claude Code hook event
+Worker                         Daemon                      Supervisor
+  │                              │                              │
+  │ vault_upsert_entity          │                              │
+  │ (type: checkpoint)           │                              │
+  ├─────────────────────────────▶│                              │
+  │                              │ INSERT entities              │
+  │                              │                              │
+  │                              │ watchCheckpoints (3s poll)   │
+  │                              │ PollNewCheckpoints           │
+  │                              │                              │
+  │                              │ pushToRole("supervisor")     │
+  │                              ├─────────────────────────────▶│
+  │                              │  notify/checkpoint_created   │
+  │                              │                              │
+  │                              │                              │ vault_upsert_entity
+  │                              │                              │ (answer in meta)
+  │                              │◀─────────────────────────────┤
+  │                              │ UPDATE entities              │
+  │                              │                              │
+  │                              │ PollAnsweredCheckpoints      │
+  │  notify/checkpoint_answered  │                              │
+  │◀─────────────────────────────┤ pushToSession(origin)        │
+  │                              │                              │
+```
+
+## Flux — role management
+
+```
+Client connect
   │
   ▼
-┌──────────────┐                    ┌──────────────┐
-│ readBody()   │ ──────────────────▶│ jsonPayload() │
-│ io.LimitRead │                    │ validate JSON │
-└──────────────┘                    └──────┬───────┘
-                                          │
-                                          ▼
-                                   ┌──────────────┐
-                                   │ INSERT buffer │
-                                   │ as JSONB      │
-                                   └──────┬───────┘
-                                          │
-                                          ▼
-                                   ┌──────────────┐
-                                   │ ring.Push()  │
-                                   │ update total │
-                                   └──────────────┘
-```
-
-### Compaction signal (UserPromptSubmit only)
-
-```
-ring.ShouldSignal()
-  │ total/4 > 2000?
+register(session_id, role)
   │
-  ├── no  → (silent)
-  │
-  └── yes → HTTP response body "[vault] ~N tokens"
-              │
-              ▼
-         Claude Code injects response into context
-         Claude sees signal, invokes prends-note
-```
-
-### Session start (context injection)
-
-```
-SessionStart hook
+  ├── session_id exists in agents?
+  │     yes → restore role from DB, push notify/role_restored
+  │     no  → INSERT agents
   │
   ▼
-┌────────────────────┐
-│ INSERT sessions    │
-│ ensureGitignore()  │
-└────────┬───────────┘
-         │
-         ▼
-┌────────────────────┐
-│ buildStartContext()│
-│ 3x QueryContext    │
-│ types, todos,      │
-│ constraints        │
-└────────┬───────────┘
-         │
-         ▼
-    HTTP response body → injected by Claude Code
+assume_role(role, session_id?)
+  │
+  ├── role = supervisor?
+  │     yes → check singleton (agents WHERE role=supervisor AND connected=1)
+  │           already active → reject (-32603)
+  │           none → UPDATE agents, grant role
+  │
+  ├── downgrade from supervisor?
+  │     yes → post-action: checkNoSupervisor()
+  │           if count(supervisor, connected=1) = 0 → broadcast notify/no_supervisor
+  │
+  ▼
+disconnect (removeClient)
+  │
+  ├── UPDATE agents SET connected=0
+  └── was supervisor? → checkNoSupervisor()
 ```
 
-## Types publics
+## Types publics (internal/vault)
 
 ```
-╔═════════════════════════════════════════════════════╗
-║  type Server struct {                               ║
-║      db         *sql.DB      // MaxOpenConns=1      ║
-║      ring       *RingDumper  // set once             ║
-║      projectDir string                              ║
-║      sessionID  string       // guarded by mu        ║
-║      mu         sync.RWMutex                        ║
-║  }                                                  ║
-╠═════════════════════════════════════════════════════╣
-║  type RingDumper struct {                           ║
-║      mu    sync.Mutex                               ║
-║      buf   [10]entry   // fixed ring                ║
-║      head  int         // next write position        ║
-║      total int         // sum of all entry sizes     ║
-║  }                                                  ║
-╚═════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════╗
+║  type Vault struct {                          ║
+║      DB        *sql.DB                        ║
+║      SessionFn func() string                  ║
+║  }                                            ║
+╠═══════════════════════════════════════════════╣
+║  type Result struct {                         ║
+║      Content []Content                        ║
+║      IsError bool                             ║
+║  }                                            ║
+╠═══════════════════════════════════════════════╣
+║  type Content struct {                        ║
+║      Type string  // "text"                   ║
+║      Text string                              ║
+║  }                                            ║
+╚═══════════════════════════════════════════════╝
+
+16 opérations : GetContext, SearchEntities, UpsertEntity,
+TodoTransition, ListTodos, CreateRelation, DeleteEntity,
+AddSteps, StepDone, GetEntity, WithSession,
+PollNewCheckpoints, PollAnsweredCheckpoints,
+missionChildIDs (private), TextResult, ErrorResult
 ```
