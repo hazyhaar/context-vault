@@ -33,8 +33,8 @@ Claude Code ←stdio→ [thin client MCP] ←TCP:9743→ [daemon] ←SQL→ vaul
 ## Dépendants
 
 - Claude Code (via `.mcp.json` — thin client MCP stdio)
-- Skill `supervisor` (assume_role, channel push checkpoints)
-- Skill `session-code` (vault todos, steps, checkpoints)
+- Skill `supervisor` (`skills/supervisor/`) — supervision multi-terminaux, création missions, réponse checkpoints
+- Skill `session-code` (`skills/session-code/`) — orchestration dev, missions, protocole STOP, conventions nommage
 
 ## Fichiers clés
 
@@ -45,6 +45,8 @@ Claude Code ←stdio→ [thin client MCP] ←TCP:9743→ [daemon] ←SQL→ vaul
 | `internal/vault/vault.go` | Business logic : CRUD entités, todos, steps, transitions, relations, checkpoints |
 | `internal/vault/schema.go` | DDL vault.db + migrations (agents table, etc.) |
 | `internal/vault/types.go` | Types retour MCP-indépendants (Result, Content) |
+| `skills/session-code/SKILL.md` | Skill : orchestration dev avec checkpoints et protocole STOP |
+| `skills/supervisor/SKILL.md` | Skill : supervision multi-terminaux |
 | `cmd/context-vault/main.go` | Legacy HTTP hooks server (deprecated) |
 | `cmd/context-vault/mcp.go` | Legacy MCP monolithique (deprecated) |
 
