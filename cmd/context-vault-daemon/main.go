@@ -87,6 +87,9 @@ func (d *daemon) removeClient(conn net.Conn) {
 
 	if info != nil && info.sessionID != "" {
 		d.db.Exec(`UPDATE agents SET connected = 0, last_seen_at = unixepoch() WHERE session_id = ?`, info.sessionID)
+		if info.role == "supervisor" {
+			d.checkNoSupervisor()
+		}
 	}
 }
 
@@ -119,12 +122,15 @@ func (d *daemon) handleConn(ctx context.Context, conn net.Conn) {
 			continue
 		}
 
-		resp := d.handleRequest(&req, info)
+		resp, postActions := d.handleRequest(&req, info)
 		if resp != nil {
 			if err := info.enc.Encode(resp); err != nil {
 				slog.Warn("encode error", "remote", remote, "err", err)
 				return
 			}
+		}
+		for _, fn := range postActions {
+			fn()
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -136,7 +142,7 @@ func (d *daemon) handleConn(ctx context.Context, conn net.Conn) {
 
 // ── Request router ───────────────────────────────────────────────────────────
 
-func (d *daemon) handleRequest(req *jsonrpcRequest, info *clientInfo) *jsonrpcResponse {
+func (d *daemon) handleRequest(req *jsonrpcRequest, info *clientInfo) (*jsonrpcResponse, []func()) {
 	// Per-request vault scoped to the client's session ID.
 	// This ensures session_origin is set correctly on created entities.
 	sv := d.v.WithSession(info.sessionID)
@@ -147,7 +153,7 @@ func (d *daemon) handleRequest(req *jsonrpcRequest, info *clientInfo) *jsonrpcRe
 	case "vault/assume_role":
 		return d.handleAssumeRole(req, info)
 	case "vault/list_workers":
-		return d.handleListWorkers(req)
+		return d.handleListWorkers(req), nil
 	case "vault/get_context":
 		return d.callTool(req, func(args json.RawMessage) vault.Result {
 			var p struct {
@@ -260,25 +266,25 @@ func (d *daemon) handleRequest(req *jsonrpcRequest, info *clientInfo) *jsonrpcRe
 			return sv.GetEntity(p.ID)
 		})
 	default:
-		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: " + req.Method}}
+		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: " + req.Method}}, nil
 	}
 }
 
-func (d *daemon) callTool(req *jsonrpcRequest, fn func(json.RawMessage) vault.Result) *jsonrpcResponse {
+func (d *daemon) callTool(req *jsonrpcRequest, fn func(json.RawMessage) vault.Result) (*jsonrpcResponse, []func()) {
 	r := fn(req.Params)
-	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: r}
+	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: r}, nil
 }
 
-func (d *daemon) handleRegister(req *jsonrpcRequest, info *clientInfo) *jsonrpcResponse {
+func (d *daemon) handleRegister(req *jsonrpcRequest, info *clientInfo) (*jsonrpcResponse, []func()) {
 	var p struct {
 		SessionID string `json:"session_id"`
 		Role      string `json:"role"`
 	}
 	if err := json.Unmarshal(req.Params, &p); err != nil {
-		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "invalid params"}}
+		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "invalid params"}}, nil
 	}
 	if p.Role != "worker" && p.Role != "supervisor" {
-		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "role must be 'worker' or 'supervisor'"}}
+		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "role must be 'worker' or 'supervisor'"}}, nil
 	}
 
 	// Check if session already exists in agents — restore its role
@@ -297,20 +303,37 @@ func (d *daemon) handleRegister(req *jsonrpcRequest, info *clientInfo) *jsonrpcR
 	info.role = effectiveRole
 	d.mu.Unlock()
 
+	// Post-response: notify client if their role was restored from agents table
+	var post []func()
+	if effectiveRole != p.Role {
+		sessID := p.SessionID
+		reqRole := p.Role
+		effRole := effectiveRole
+		post = append(post, func() {
+			d.pushToSession(sessID, "notify/role_restored", map[string]any{
+				"session_id":     sessID,
+				"requested_role": reqRole,
+				"restored_role":  effRole,
+			})
+		})
+	}
+	// Note: no checkNoSupervisor here — a worker registering doesn't need to be
+	// told there's no supervisor. The alert fires on supervisor disconnect/downgrade.
+
 	slog.Info("client registered", "session", p.SessionID, "role", effectiveRole)
-	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]string{"status": "registered", "role": effectiveRole}}
+	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]string{"status": "registered", "role": effectiveRole}}, post
 }
 
-func (d *daemon) handleAssumeRole(req *jsonrpcRequest, info *clientInfo) *jsonrpcResponse {
+func (d *daemon) handleAssumeRole(req *jsonrpcRequest, info *clientInfo) (*jsonrpcResponse, []func()) {
 	var p struct {
 		Role      string `json:"role"`
 		SessionID string `json:"session_id"`
 	}
 	if err := json.Unmarshal(req.Params, &p); err != nil {
-		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "invalid params"}}
+		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "invalid params"}}, nil
 	}
 	if p.Role != "worker" && p.Role != "supervisor" {
-		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "role must be 'worker' or 'supervisor'"}}
+		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "role must be 'worker' or 'supervisor'"}}, nil
 	}
 
 	d.mu.Lock()
@@ -319,10 +342,8 @@ func (d *daemon) handleAssumeRole(req *jsonrpcRequest, info *clientInfo) *jsonrp
 	// If caller provides a stable session_id, update the client identity
 	if p.SessionID != "" && p.SessionID != info.sessionID {
 		oldSess := info.sessionID
-		// Mark old session disconnected
 		d.db.Exec(`UPDATE agents SET connected = 0, last_seen_at = unixepoch() WHERE session_id = ?`, oldSess)
 		info.sessionID = p.SessionID
-		// Upsert new session in agents
 		d.db.Exec(`INSERT INTO agents (session_id, role, connected, registered_at, last_seen_at) VALUES (?, ?, 1, unixepoch(), unixepoch())
 			ON CONFLICT(session_id) DO UPDATE SET connected = 1, last_seen_at = unixepoch()`, p.SessionID, p.Role)
 		slog.Info("client session changed", "from", oldSess, "to", p.SessionID)
@@ -336,7 +357,7 @@ func (d *daemon) handleAssumeRole(req *jsonrpcRequest, info *clientInfo) *jsonrp
 			return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{
 				Code:    -32603,
 				Message: fmt.Sprintf("supervisor already active (session %s)", existingSess),
-			}}
+			}}, nil
 		}
 	}
 
@@ -346,8 +367,14 @@ func (d *daemon) handleAssumeRole(req *jsonrpcRequest, info *clientInfo) *jsonrp
 	// Persist role change in agents table
 	d.db.Exec(`UPDATE agents SET role = ?, last_seen_at = unixepoch() WHERE session_id = ?`, p.Role, info.sessionID)
 
+	// Post-response: alert if supervisor was downgraded and no supervisor remains
+	var post []func()
+	if oldRole == "supervisor" && p.Role != "supervisor" {
+		post = append(post, d.checkNoSupervisor)
+	}
+
 	slog.Info("client role changed", "session", info.sessionID, "from", oldRole, "to", p.Role)
-	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]string{"status": "role_changed", "role": p.Role}}
+	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]string{"status": "role_changed", "role": p.Role}}, post
 }
 
 func (d *daemon) handleListWorkers(req *jsonrpcRequest) *jsonrpcResponse {
@@ -372,6 +399,19 @@ func (d *daemon) handleListWorkers(req *jsonrpcRequest) *jsonrpcResponse {
 		})
 	}
 	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: workers}
+}
+
+// checkNoSupervisor alerts all connected clients if no supervisor is active.
+func (d *daemon) checkNoSupervisor() {
+	var count int
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM agents WHERE role = 'supervisor' AND connected = 1`).Scan(&count); err != nil {
+		return
+	}
+	if count == 0 {
+		d.pushToSession("", "notify/no_supervisor", map[string]any{
+			"message": "no supervisor connected",
+		})
+	}
 }
 
 // ── Checkpoint watcher ───────────────────────────────────────────────────────

@@ -206,6 +206,78 @@ func TestDaemon_AgentsRoleRestore(t *testing.T) {
 	if !strings.Contains(string(resultBytes), "supervisor") {
 		t.Fatalf("expected role restored to supervisor, got: %s", string(resultBytes))
 	}
+
+	// After register response, a notify/role_restored notification should follow
+	c2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if !s2.Scan() {
+		t.Fatal("no role_restored notification received")
+	}
+	notifLine := s2.Text()
+	if !strings.Contains(notifLine, "role_restored") {
+		t.Fatalf("expected role_restored notification, got: %s", notifLine)
+	}
+	if !strings.Contains(notifLine, "supervisor") {
+		t.Fatalf("expected supervisor in notification, got: %s", notifLine)
+	}
+}
+
+func TestDaemon_NoSupervisorOnDowngrade(t *testing.T) {
+	_, ln := testDaemon(t)
+
+	// Worker registers, then assumes supervisor
+	c1, s1 := dial(t, ln)
+	rpcCall(t, c1, s1, "register", map[string]string{"session_id": "w1", "role": "worker"})
+	rpcCall(t, c1, s1, "vault/assume_role", map[string]string{"role": "supervisor"})
+
+	// Connect a second worker
+	c2, s2 := dial(t, ln)
+	rpcCall(t, c2, s2, "register", map[string]string{"session_id": "w2", "role": "worker"})
+
+	// Downgrade supervisor to worker — should trigger no_supervisor to all
+	rpcCall(t, c1, s1, "vault/assume_role", map[string]string{"role": "worker"})
+
+	// Worker c1 should receive notify/no_supervisor (post-action)
+	c1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if !s1.Scan() {
+		t.Fatal("c1 did not receive no_supervisor notification")
+	}
+	if !strings.Contains(s1.Text(), "no_supervisor") {
+		t.Fatalf("expected no_supervisor, got: %s", s1.Text())
+	}
+
+	// Worker c2 should also receive notify/no_supervisor
+	c2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if !s2.Scan() {
+		t.Fatal("c2 did not receive no_supervisor notification")
+	}
+	if !strings.Contains(s2.Text(), "no_supervisor") {
+		t.Fatalf("expected no_supervisor, got: %s", s2.Text())
+	}
+}
+
+func TestDaemon_NoSupervisorOnDisconnect(t *testing.T) {
+	_, ln := testDaemon(t)
+
+	// Supervisor registers
+	c1, s1 := dial(t, ln)
+	rpcCall(t, c1, s1, "register", map[string]string{"session_id": "sup", "role": "worker"})
+	rpcCall(t, c1, s1, "vault/assume_role", map[string]string{"role": "supervisor"})
+
+	// Worker registers
+	c2, s2 := dial(t, ln)
+	rpcCall(t, c2, s2, "register", map[string]string{"session_id": "w1", "role": "worker"})
+
+	// Supervisor disconnects
+	c1.Close()
+
+	// Worker should receive notify/no_supervisor
+	c2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if !s2.Scan() {
+		t.Fatal("worker did not receive no_supervisor after supervisor disconnect")
+	}
+	if !strings.Contains(s2.Text(), "no_supervisor") {
+		t.Fatalf("expected no_supervisor, got: %s", s2.Text())
+	}
 }
 
 func TestDaemon_UnknownMethod(t *testing.T) {
