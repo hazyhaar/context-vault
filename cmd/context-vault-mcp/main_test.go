@@ -2,11 +2,15 @@ package main
 
 import (
 	"bufio"
+	"database/sql"
 	"encoding/json"
 	"net"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hazyhaar/context-vault/internal/vault"
+	_ "modernc.org/sqlite"
 )
 
 func TestToolNameToMethod(t *testing.T) {
@@ -32,7 +36,7 @@ func TestHandleRequest_Initialize(t *testing.T) {
 		ID:      json.RawMessage(`1`),
 		Method:  "initialize",
 	}
-	resp := handleRequest(nil, req, true)
+	resp := handleRequest(nil, nil, req, true)
 	if resp == nil {
 		t.Fatal("expected response")
 	}
@@ -51,7 +55,7 @@ func TestHandleRequest_ToolsList(t *testing.T) {
 		ID:      json.RawMessage(`2`),
 		Method:  "tools/list",
 	}
-	resp := handleRequest(nil, req, false)
+	resp := handleRequest(nil, nil, req, false)
 	if resp == nil {
 		t.Fatal("expected response")
 	}
@@ -123,7 +127,7 @@ func TestHandleRequest_ToolsCallForward(t *testing.T) {
 		Params:  params,
 	}
 
-	resp := handleRequest(dc, req, false)
+	resp := handleRequest(dc, nil, req, false)
 	if resp == nil {
 		t.Fatal("expected response")
 	}
@@ -134,5 +138,40 @@ func TestHandleRequest_ToolsCallForward(t *testing.T) {
 	b, _ := json.Marshal(resp.Result)
 	if !strings.Contains(string(b), "mock result for vault/get_context") {
 		t.Fatalf("expected forwarded result, got: %s", string(b))
+	}
+}
+
+func TestHandleRequest_FallbackLocal(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(vault.Schema); err != nil {
+		t.Fatal(err)
+	}
+	v := vault.New(db, func() string { return "" })
+
+	// Create entity via fallback
+	params, _ := json.Marshal(map[string]any{
+		"name":      "vault_upsert_entity",
+		"arguments": map[string]any{"namespace": "test", "type": "decision", "label": "fallback test", "meta": map[string]any{}},
+	})
+	req := &jsonrpcRequest{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage(`10`),
+		Method:  "tools/call",
+		Params:  params,
+	}
+	resp := handleRequest(nil, v, req, false)
+	if resp == nil {
+		t.Fatal("expected response")
+	}
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	}
+	b, _ := json.Marshal(resp.Result)
+	if !strings.Contains(string(b), "created entity") {
+		t.Fatalf("expected 'created entity', got: %s", string(b))
 	}
 }

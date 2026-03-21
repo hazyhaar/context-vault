@@ -137,3 +137,74 @@ func TestDaemon_UnknownMethod(t *testing.T) {
 		t.Fatalf("expected -32601, got %d", resp.Error.Code)
 	}
 }
+
+// ── E2E: daemon + worker + supervisor ────────────────────────────────────────
+
+func TestE2E_CheckpointRouting(t *testing.T) {
+	d, ln := testDaemon(t)
+
+	// Start checkpoint watcher
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go d.watchCheckpoints(ctx)
+
+	// Connect worker
+	workerConn, workerScanner := dial(t, ln)
+	rpcCall(t, workerConn, workerScanner, "register", map[string]string{"session_id": "worker-1", "role": "worker"})
+
+	// Connect supervisor
+	supConn, supScanner := dial(t, ln)
+	rpcCall(t, supConn, supScanner, "register", map[string]string{"session_id": "sup-1", "role": "supervisor"})
+
+	// Worker creates a blocking checkpoint (session_origin set manually since vault.SessionFn returns "")
+	// We need to set session_origin on the entity — use direct DB for that
+	resp := rpcCall(t, workerConn, workerScanner, "vault/upsert_entity", map[string]any{
+		"namespace": "test",
+		"type":      "checkpoint",
+		"label":     "CHECKPOINT e2e test",
+		"meta": map[string]any{
+			"question": "Approve?",
+			"blocking": true,
+		},
+	})
+	resultBytes, _ := json.Marshal(resp.Result)
+	if !strings.Contains(string(resultBytes), "created entity") {
+		t.Fatalf("expected created entity, got: %s", string(resultBytes))
+	}
+
+	// Set session_origin on the checkpoint to "worker-1" (the daemon's SessionFn returns "")
+	d.db.Exec(`UPDATE entities SET session_origin = 'worker-1' WHERE id = 1`)
+
+	// Wait for watcher to detect the new checkpoint and push to supervisor
+	supConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if !supScanner.Scan() {
+		t.Fatal("supervisor did not receive checkpoint notification")
+	}
+	notifLine := supScanner.Text()
+	if !strings.Contains(notifLine, "checkpoint_created") {
+		t.Fatalf("expected checkpoint_created notification, got: %s", notifLine)
+	}
+	if !strings.Contains(notifLine, "CHECKPOINT e2e test") {
+		t.Fatalf("expected checkpoint label in notification, got: %s", notifLine)
+	}
+
+	// Supervisor answers the checkpoint
+	rpcCall(t, supConn, supScanner, "vault/upsert_entity", map[string]any{
+		"id":    1,
+		"label": "CHECKPOINT e2e test",
+		"meta":  map[string]any{"answer": "Approved"},
+	})
+
+	// Wait for watcher to detect the answer and push to worker
+	workerConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if !workerScanner.Scan() {
+		t.Fatal("worker did not receive checkpoint_answered notification")
+	}
+	answerLine := workerScanner.Text()
+	if !strings.Contains(answerLine, "checkpoint_answered") {
+		t.Fatalf("expected checkpoint_answered notification, got: %s", answerLine)
+	}
+	if !strings.Contains(answerLine, "Approved") {
+		t.Fatalf("expected answer 'Approved' in notification, got: %s", answerLine)
+	}
+}

@@ -5,15 +5,20 @@ package main
 
 import (
 	"bufio"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hazyhaar/context-vault/internal/vault"
+	_ "modernc.org/sqlite"
 )
 
 const (
@@ -291,29 +296,40 @@ func main() {
 
 	out := newStdoutWriter()
 
-	// Dial daemon
+	var dc *daemonConn
+	var localVault *vault.Vault
+
+	// Try to dial daemon; fallback to direct SQLite if unavailable
 	dc, err := dialDaemon(daemonAddr)
 	if err != nil {
-		slog.Error("cannot connect to daemon", "addr", daemonAddr, "err", err)
-		os.Exit(1)
-	}
-	defer dc.close()
+		slog.Warn("daemon unreachable, fallback to direct SQLite", "addr", daemonAddr, "err", err)
+		localVault = openFallbackVault()
+		if localVault == nil {
+			slog.Error("fallback SQLite also failed — no vault available")
+			os.Exit(1)
+		}
+	} else {
+		defer dc.close()
 
-	// Register with daemon
-	sessionID := os.Getenv("CLAUDE_SESSION_ID")
-	if sessionID == "" {
-		sessionID = fmt.Sprintf("mcp-%d", os.Getpid())
+		// Register with daemon
+		sessionID := os.Getenv("CLAUDE_SESSION_ID")
+		if sessionID == "" {
+			sessionID = fmt.Sprintf("mcp-%d", os.Getpid())
+		}
+		regParams, _ := json.Marshal(map[string]string{"session_id": sessionID, "role": *roleFlag})
+		if _, regErr := dc.callDaemon("register", regParams); regErr != nil {
+			slog.Warn("register failed, falling back to direct SQLite", "err", regErr)
+			dc.close()
+			dc = nil
+			localVault = openFallbackVault()
+			if localVault == nil {
+				slog.Error("fallback SQLite also failed")
+				os.Exit(1)
+			}
+		} else {
+			slog.Info("registered with daemon", "session", sessionID, "role", *roleFlag)
+		}
 	}
-	regParams, _ := json.Marshal(map[string]string{"session_id": sessionID, "role": *roleFlag})
-	if _, err := dc.callDaemon("register", regParams); err != nil {
-		slog.Error("register failed", "err", err)
-		os.Exit(1)
-	}
-	slog.Info("registered with daemon", "session", sessionID, "role", *roleFlag)
-
-	// TODO: background goroutine to read push notifications from daemon
-	// For now, the daemon sends notifications inline (not yet implemented as async push).
-	// This will be wired in #694 (event routing).
 
 	// Stdio MCP loop
 	scanner := bufio.NewScanner(os.Stdin)
@@ -331,7 +347,7 @@ func main() {
 			continue
 		}
 
-		resp := handleRequest(dc, &req, *channelFlag)
+		resp := handleRequest(dc, localVault, &req, *channelFlag)
 		if resp != nil {
 			if err := out.encode(resp); err != nil {
 				slog.Error("encode response", "err", err)
@@ -344,7 +360,32 @@ func main() {
 	}
 }
 
-func handleRequest(dc *daemonConn, req *jsonrpcRequest, channelEnabled bool) *jsonrpcResponse {
+const dbRelPath = ".claude/vault.db"
+
+// openFallbackVault opens vault.db directly for fallback mode.
+func openFallbackVault() *vault.Vault {
+	projectDir := os.Getenv("PROJECT_DIR")
+	if projectDir == "" {
+		projectDir, _ = os.Getwd()
+	}
+	dbPath := filepath.Join(projectDir, dbRelPath)
+	dsn := dbPath + "?_txlock=immediate&_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		slog.Error("fallback: open db", "err", err)
+		return nil
+	}
+	if _, err := db.Exec(vault.Schema); err != nil {
+		slog.Error("fallback: schema", "err", err)
+		db.Close()
+		return nil
+	}
+	vault.Migrate(db)
+	slog.Info("fallback: using direct SQLite", "db", dbPath)
+	return vault.New(db, func() string { return "" })
+}
+
+func handleRequest(dc *daemonConn, localVault *vault.Vault, req *jsonrpcRequest, channelEnabled bool) *jsonrpcResponse {
 	switch req.Method {
 	case "initialize":
 		caps := map[string]any{"tools": map[string]any{}}
@@ -381,19 +422,125 @@ func handleRequest(dc *daemonConn, req *jsonrpcRequest, channelEnabled bool) *js
 			return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "invalid params"}}
 		}
 
-		// Translate tool name to daemon method: vault_get_context → vault/get_context
-		method := toolNameToMethod(params.Name)
-
-		daemonResp, err := dc.callDaemon(method, params.Arguments)
-		if err != nil {
-			slog.Error("daemon call failed", "method", method, "err", err)
-			return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32603, Message: "daemon error: " + err.Error()}}
+		// Daemon mode: forward to daemon
+		if dc != nil {
+			method := toolNameToMethod(params.Name)
+			daemonResp, err := dc.callDaemon(method, params.Arguments)
+			if err != nil {
+				slog.Error("daemon call failed", "method", method, "err", err)
+				return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32603, Message: "daemon error: " + err.Error()}}
+			}
+			return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: daemonResp.Result, Error: daemonResp.Error}
 		}
 
-		// Forward daemon response with original request ID
-		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: daemonResp.Result, Error: daemonResp.Error}
+		// Fallback mode: dispatch locally
+		if localVault != nil {
+			r := dispatchLocal(localVault, params.Name, params.Arguments)
+			return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: r}
+		}
+
+		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32603, Message: "no daemon and no fallback available"}}
 
 	default:
 		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: " + req.Method}}
+	}
+}
+
+// dispatchLocal handles tools/call in fallback mode using local vault.
+func dispatchLocal(v *vault.Vault, name string, args json.RawMessage) vault.Result {
+	switch name {
+	case "vault_get_context":
+		var p struct {
+			Namespace string `json:"namespace"`
+			Session   string `json:"session"`
+		}
+		json.Unmarshal(args, &p)
+		return v.GetContext(p.Namespace, p.Session)
+	case "vault_search_entities":
+		var p struct {
+			Type      string `json:"type"`
+			Namespace string `json:"namespace"`
+			Query     string `json:"query"`
+			Session   string `json:"session"`
+			Limit     int    `json:"limit"`
+		}
+		json.Unmarshal(args, &p)
+		return v.SearchEntities(p.Type, p.Namespace, p.Query, p.Session, p.Limit)
+	case "vault_upsert_entity":
+		var p struct {
+			ID          *int64          `json:"id"`
+			Namespace   string          `json:"namespace"`
+			Type        string          `json:"type"`
+			Label       string          `json:"label"`
+			Sensitivity int             `json:"sensitivity"`
+			Meta        json.RawMessage `json:"meta"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return vault.ErrorResult("invalid params: " + err.Error())
+		}
+		return v.UpsertEntity(p.ID, p.Namespace, p.Type, p.Label, p.Sensitivity, p.Meta)
+	case "vault_todo_transition":
+		var p struct {
+			ID     int64  `json:"id"`
+			Status string `json:"status"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return vault.ErrorResult("invalid params: " + err.Error())
+		}
+		return v.TodoTransition(p.ID, p.Status)
+	case "vault_list_todos":
+		var p struct {
+			Namespace   string `json:"namespace"`
+			Session     string `json:"session"`
+			IncludeDone bool   `json:"include_done"`
+		}
+		json.Unmarshal(args, &p)
+		return v.ListTodos(p.Namespace, p.Session, p.IncludeDone)
+	case "vault_create_relation":
+		var p struct {
+			FromID int64  `json:"from_id"`
+			ToID   int64  `json:"to_id"`
+			Type   string `json:"type"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return vault.ErrorResult("invalid params: " + err.Error())
+		}
+		return v.CreateRelation(p.FromID, p.ToID, p.Type)
+	case "vault_delete_entity":
+		var p struct {
+			ID int64 `json:"id"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return vault.ErrorResult("invalid params: " + err.Error())
+		}
+		return v.DeleteEntity(p.ID)
+	case "vault_add_steps":
+		var p struct {
+			TodoID int64    `json:"todo_id"`
+			Steps  []string `json:"steps"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return vault.ErrorResult("invalid params: " + err.Error())
+		}
+		return v.AddSteps(p.TodoID, p.Steps)
+	case "vault_step_done":
+		var p struct {
+			TodoID int64  `json:"todo_id"`
+			Step   string `json:"step"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return vault.ErrorResult("invalid params: " + err.Error())
+		}
+		return v.StepDone(p.TodoID, p.Step)
+	case "vault_get_entity":
+		var p struct {
+			ID int64 `json:"id"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return vault.ErrorResult("invalid params: " + err.Error())
+		}
+		return v.GetEntity(p.ID)
+	default:
+		return vault.ErrorResult("unknown tool: " + name)
 	}
 }

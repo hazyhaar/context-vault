@@ -769,15 +769,25 @@ func (v *Vault) GetEntity(entityID int64) Result {
 
 // AnsweredCheckpoint represents a checkpoint that received an answer.
 type AnsweredCheckpoint struct {
-	ID        int64
-	Label     string
-	Answer    string
-	TsUpdated int64
+	ID            int64
+	Label         string
+	Answer        string
+	SessionOrigin string
+	TsUpdated     int64
+}
+
+// NewCheckpoint represents a newly created blocking checkpoint (no answer yet).
+type NewCheckpoint struct {
+	ID            int64
+	Label         string
+	Question      string
+	SessionOrigin string
+	TsCreated     int64
 }
 
 // PollAnsweredCheckpoints returns checkpoints updated after watermark that have an answer.
 func (v *Vault) PollAnsweredCheckpoints(watermark int64) ([]AnsweredCheckpoint, error) {
-	const query = `SELECT id, label, json_extract(meta, '$.answer'), ts_updated
+	const query = `SELECT id, label, json_extract(meta, '$.answer'), COALESCE(session_origin, ''), ts_updated
 		FROM entities
 		WHERE type = 'checkpoint'
 		  AND json_extract(meta, '$.blocking') = 1
@@ -794,7 +804,33 @@ func (v *Vault) PollAnsweredCheckpoints(watermark int64) ([]AnsweredCheckpoint, 
 	var results []AnsweredCheckpoint
 	for rows.Next() {
 		var cp AnsweredCheckpoint
-		if rows.Scan(&cp.ID, &cp.Label, &cp.Answer, &cp.TsUpdated) == nil {
+		if rows.Scan(&cp.ID, &cp.Label, &cp.Answer, &cp.SessionOrigin, &cp.TsUpdated) == nil {
+			results = append(results, cp)
+		}
+	}
+	return results, rows.Err()
+}
+
+// PollNewCheckpoints returns blocking checkpoints created after watermark that have no answer yet.
+func (v *Vault) PollNewCheckpoints(watermark int64) ([]NewCheckpoint, error) {
+	const query = `SELECT id, label, COALESCE(json_extract(meta, '$.question'), ''), COALESCE(session_origin, ''), ts_created
+		FROM entities
+		WHERE type = 'checkpoint'
+		  AND json_extract(meta, '$.blocking') = 1
+		  AND json_extract(meta, '$.answer') IS NULL
+		  AND ts_created > ?
+		ORDER BY ts_created ASC`
+
+	rows, err := v.DB.QueryContext(context.Background(), query, watermark)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []NewCheckpoint
+	for rows.Next() {
+		var cp NewCheckpoint
+		if rows.Scan(&cp.ID, &cp.Label, &cp.Question, &cp.SessionOrigin, &cp.TsCreated) == nil {
 			results = append(results, cp)
 		}
 	}

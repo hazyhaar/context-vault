@@ -280,7 +280,10 @@ func (d *daemon) handleRegister(req *jsonrpcRequest, info *clientInfo) *jsonrpcR
 // ── Checkpoint watcher ───────────────────────────────────────────────────────
 
 func (d *daemon) watchCheckpoints(ctx context.Context) {
-	watermark := time.Now().Unix()
+	answeredWM := time.Now().Unix() - 1
+	createdWM := time.Now().Unix() - 1
+	notifiedCreated := make(map[int64]bool)
+	notifiedAnswered := make(map[int64]bool)
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -291,32 +294,73 @@ func (d *daemon) watchCheckpoints(ctx context.Context) {
 		case <-ticker.C:
 		}
 
-		checkpoints, err := d.v.PollAnsweredCheckpoints(watermark)
+		// Poll answered checkpoints → route to the session that created them
+		answered, err := d.v.PollAnsweredCheckpoints(answeredWM)
 		if err != nil {
-			slog.Warn("watch: poll error", "err", err)
-			continue
+			slog.Warn("watch: poll answered error", "err", err)
+		}
+		for _, cp := range answered {
+			if notifiedAnswered[cp.ID] {
+				continue
+			}
+			notifiedAnswered[cp.ID] = true
+			d.pushToSession(cp.SessionOrigin, "notify/checkpoint_answered", map[string]any{
+				"checkpoint_id": cp.ID,
+				"label":         cp.Label,
+				"answer":        cp.Answer,
+			})
+			if cp.TsUpdated > answeredWM {
+				answeredWM = cp.TsUpdated
+			}
 		}
 
-		for _, cp := range checkpoints {
-			d.mu.RLock()
-			for _, ci := range d.clients {
-				notif := map[string]any{
-					"jsonrpc": "2.0",
-					"method":  "notify/checkpoint_answered",
-					"params": map[string]any{
-						"checkpoint_id": cp.ID,
-						"label":         cp.Label,
-						"answer":        cp.Answer,
-					},
-				}
-				if err := ci.enc.Encode(notif); err != nil {
-					slog.Warn("watch: push failed", "session", ci.sessionID, "err", err)
-				}
+		// Poll new blocking checkpoints (no answer) → route to supervisors
+		created, err := d.v.PollNewCheckpoints(createdWM)
+		if err != nil {
+			slog.Warn("watch: poll created error", "err", err)
+		}
+		for _, cp := range created {
+			if notifiedCreated[cp.ID] {
+				continue
 			}
-			d.mu.RUnlock()
+			notifiedCreated[cp.ID] = true
+			d.pushToRole("supervisor", "notify/checkpoint_created", map[string]any{
+				"checkpoint_id": cp.ID,
+				"label":         cp.Label,
+				"question":      cp.Question,
+				"source_session": cp.SessionOrigin,
+			})
+			if cp.TsCreated > createdWM {
+				createdWM = cp.TsCreated
+			}
+		}
+	}
+}
 
-			if cp.TsUpdated > watermark {
-				watermark = cp.TsUpdated
+// pushToSession sends a notification to all clients with the given session ID.
+// If session is empty, broadcasts to all clients.
+func (d *daemon) pushToSession(session, method string, params map[string]any) {
+	notif := map[string]any{"jsonrpc": "2.0", "method": method, "params": params}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	for _, ci := range d.clients {
+		if session == "" || ci.sessionID == session {
+			if err := ci.enc.Encode(notif); err != nil {
+				slog.Warn("push failed", "session", ci.sessionID, "method", method, "err", err)
+			}
+		}
+	}
+}
+
+// pushToRole sends a notification to all clients with the given role.
+func (d *daemon) pushToRole(role, method string, params map[string]any) {
+	notif := map[string]any{"jsonrpc": "2.0", "method": method, "params": params}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	for _, ci := range d.clients {
+		if ci.role == role {
+			if err := ci.enc.Encode(notif); err != nil {
+				slog.Warn("push failed", "session", ci.sessionID, "role", role, "method", method, "err", err)
 			}
 		}
 	}
