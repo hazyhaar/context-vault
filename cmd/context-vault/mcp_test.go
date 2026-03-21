@@ -73,6 +73,40 @@ func TestUpsertEntity_MergeMeta(t *testing.T) {
 	}
 }
 
+func TestUpsertEntity_UpdateNamespaceTypeSensitivity(t *testing.T) {
+	s := testServer(t)
+
+	// Create entity
+	r := call(t, s.mcpUpsertEntity, `{"namespace":"old-ns","type":"decision","label":"movable","meta":{}}`)
+	mustNotError(t, r)
+
+	// Update namespace
+	r = call(t, s.mcpUpsertEntity, `{"id":1,"namespace":"new-ns","label":"movable"}`)
+	mustNotError(t, r)
+
+	// Update type
+	r = call(t, s.mcpUpsertEntity, `{"id":1,"type":"constraint","label":"movable"}`)
+	mustNotError(t, r)
+
+	// Update sensitivity
+	r = call(t, s.mcpUpsertEntity, `{"id":1,"sensitivity":2,"label":"movable"}`)
+	mustNotError(t, r)
+
+	// Verify all fields changed
+	var ns, typ string
+	var sens int
+	s.db.QueryRow(`SELECT namespace, type, sensitivity FROM entities WHERE id = 1`).Scan(&ns, &typ, &sens)
+	if ns != "new-ns" {
+		t.Errorf("expected namespace=new-ns, got %s", ns)
+	}
+	if typ != "constraint" {
+		t.Errorf("expected type=constraint, got %s", typ)
+	}
+	if sens != 2 {
+		t.Errorf("expected sensitivity=2, got %d", sens)
+	}
+}
+
 func TestUpsertEntity_MergeMetaNullDeletesKey(t *testing.T) {
 	s := testServer(t)
 
