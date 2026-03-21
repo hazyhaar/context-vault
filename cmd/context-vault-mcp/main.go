@@ -282,6 +282,17 @@ func toolDefinitions() []mcpToolDef {
 				},
 			},
 		},
+		{
+			Name:        "vault_assume_role",
+			Description: "Change le role de la session (worker/supervisor). Un seul superviseur actif a la fois.",
+			InputSchema: map[string]any{
+				"type":     "object",
+				"required": []string{"role"},
+				"properties": map[string]any{
+					"role": map[string]any{"type": "string", "description": "Nouveau role", "enum": []string{"worker", "supervisor"}},
+				},
+			},
+		},
 	}
 }
 

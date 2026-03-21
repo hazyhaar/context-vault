@@ -138,6 +138,61 @@ func TestDaemon_UnknownMethod(t *testing.T) {
 	}
 }
 
+// ── assume_role tests ────────────────────────────────────────────────────────
+
+func TestAssumeRole_Supervisor(t *testing.T) {
+	_, ln := testDaemon(t)
+	conn, scanner := dial(t, ln)
+	rpcCall(t, conn, scanner, "register", map[string]string{"session_id": "s1", "role": "worker"})
+
+	resp := rpcCall(t, conn, scanner, "vault/assume_role", map[string]string{"role": "supervisor"})
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	}
+	b, _ := json.Marshal(resp.Result)
+	if !strings.Contains(string(b), "role_changed") {
+		t.Fatalf("expected role_changed, got: %s", string(b))
+	}
+}
+
+func TestAssumeRole_RejectDouble(t *testing.T) {
+	_, ln := testDaemon(t)
+
+	// First client becomes supervisor
+	c1, s1 := dial(t, ln)
+	rpcCall(t, c1, s1, "register", map[string]string{"session_id": "s1", "role": "worker"})
+	rpcCall(t, c1, s1, "vault/assume_role", map[string]string{"role": "supervisor"})
+
+	// Second client tries to become supervisor → rejected
+	c2, s2 := dial(t, ln)
+	rpcCall(t, c2, s2, "register", map[string]string{"session_id": "s2", "role": "worker"})
+	resp := rpcCall(t, c2, s2, "vault/assume_role", map[string]string{"role": "supervisor"})
+	if resp.Error == nil {
+		t.Fatal("expected error for double supervisor")
+	}
+	if !strings.Contains(resp.Error.Message, "supervisor already active") {
+		t.Fatalf("expected supervisor already active, got: %s", resp.Error.Message)
+	}
+}
+
+func TestAssumeRole_Downgrade(t *testing.T) {
+	_, ln := testDaemon(t)
+
+	// Client becomes supervisor then downgrades
+	c1, s1 := dial(t, ln)
+	rpcCall(t, c1, s1, "register", map[string]string{"session_id": "s1", "role": "worker"})
+	rpcCall(t, c1, s1, "vault/assume_role", map[string]string{"role": "supervisor"})
+	rpcCall(t, c1, s1, "vault/assume_role", map[string]string{"role": "worker"})
+
+	// Second client can now become supervisor (slot freed)
+	c2, s2 := dial(t, ln)
+	rpcCall(t, c2, s2, "register", map[string]string{"session_id": "s2", "role": "worker"})
+	resp := rpcCall(t, c2, s2, "vault/assume_role", map[string]string{"role": "supervisor"})
+	if resp.Error != nil {
+		t.Fatalf("expected success after downgrade, got error: %s", resp.Error.Message)
+	}
+}
+
 // ── E2E: daemon + worker + supervisor ────────────────────────────────────────
 
 func TestE2E_CheckpointRouting(t *testing.T) {

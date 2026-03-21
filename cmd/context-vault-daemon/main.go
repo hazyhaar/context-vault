@@ -135,6 +135,8 @@ func (d *daemon) handleRequest(req *jsonrpcRequest, info *clientInfo) *jsonrpcRe
 	switch req.Method {
 	case "register":
 		return d.handleRegister(req, info)
+	case "vault/assume_role":
+		return d.handleAssumeRole(req, info)
 	case "vault/get_context":
 		return d.callTool(req, func(args json.RawMessage) vault.Result {
 			var p struct {
@@ -275,6 +277,38 @@ func (d *daemon) handleRegister(req *jsonrpcRequest, info *clientInfo) *jsonrpcR
 
 	slog.Info("client registered", "session", p.SessionID, "role", p.Role)
 	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]string{"status": "registered"}}
+}
+
+func (d *daemon) handleAssumeRole(req *jsonrpcRequest, info *clientInfo) *jsonrpcResponse {
+	var p struct {
+		Role string `json:"role"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "invalid params"}}
+	}
+	if p.Role != "worker" && p.Role != "supervisor" {
+		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "role must be 'worker' or 'supervisor'"}}
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Singleton check: only one supervisor at a time
+	if p.Role == "supervisor" {
+		for _, ci := range d.clients {
+			if ci != info && ci.role == "supervisor" {
+				return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{
+					Code:    -32603,
+					Message: fmt.Sprintf("supervisor already active (session %s)", ci.sessionID),
+				}}
+			}
+		}
+	}
+
+	oldRole := info.role
+	info.role = p.Role
+	slog.Info("client role changed", "session", info.sessionID, "from", oldRole, "to", p.Role)
+	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]string{"status": "role_changed", "role": p.Role}}
 }
 
 // ── Checkpoint watcher ───────────────────────────────────────────────────────
