@@ -428,12 +428,13 @@ func toolDefinitions() []mcpToolDef {
 		},
 		{
 			Name:        "vault_assume_role",
-			Description: "Change le role de la session (worker/supervisor). Un seul superviseur actif a la fois.",
+			Description: "Change le role de la session (worker/supervisor). Un seul superviseur actif a la fois. session_id optionnel pour declarer un UUID stable.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"role"},
 				"properties": map[string]any{
-					"role": map[string]any{"type": "string", "description": "Nouveau role", "enum": []string{"worker", "supervisor"}},
+					"role":       map[string]any{"type": "string", "description": "Nouveau role", "enum": []string{"worker", "supervisor"}},
+					"session_id": map[string]any{"type": "string", "description": "UUID stable de la conversation (optionnel, remplace le mcp-<pid>)"},
 				},
 			},
 		},

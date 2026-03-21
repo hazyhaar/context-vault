@@ -64,6 +64,14 @@ CREATE TABLE IF NOT EXISTS compact_log (
     result_text TEXT
 );
 
+CREATE TABLE IF NOT EXISTS agents (
+    session_id    TEXT PRIMARY KEY,
+    role          TEXT NOT NULL DEFAULT 'worker',
+    connected     INTEGER NOT NULL DEFAULT 0,
+    registered_at INTEGER NOT NULL,
+    last_seen_at  INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_entities_ns_type ON entities(namespace, type);
 CREATE INDEX IF NOT EXISTS idx_entities_ts      ON entities(ts_updated DESC);
 CREATE INDEX IF NOT EXISTS idx_relations_from   ON relations(from_id);
@@ -80,4 +88,13 @@ func Migrate(db *sql.DB) {
 		ELSE step END
 		WHERE step_key = ''`)
 	db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_todo_steps_key ON todo_steps(todo_id, step_key)`)
+
+	// v2026-03-21b: add agents table for persistent session tracking.
+	db.Exec(`CREATE TABLE IF NOT EXISTS agents (
+		session_id    TEXT PRIMARY KEY,
+		role          TEXT NOT NULL DEFAULT 'worker',
+		connected     INTEGER NOT NULL DEFAULT 0,
+		registered_at INTEGER NOT NULL,
+		last_seen_at  INTEGER NOT NULL
+	)`)
 }

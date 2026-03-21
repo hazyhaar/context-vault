@@ -81,8 +81,13 @@ func (d *daemon) addClient(conn net.Conn, info *clientInfo) {
 
 func (d *daemon) removeClient(conn net.Conn) {
 	d.mu.Lock()
+	info := d.clients[conn]
 	delete(d.clients, conn)
 	d.mu.Unlock()
+
+	if info != nil && info.sessionID != "" {
+		d.db.Exec(`UPDATE agents SET connected = 0, last_seen_at = unixepoch() WHERE session_id = ?`, info.sessionID)
+	}
 }
 
 // ── Connection handler ───────────────────────────────────────────────────────
@@ -276,18 +281,30 @@ func (d *daemon) handleRegister(req *jsonrpcRequest, info *clientInfo) *jsonrpcR
 		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "role must be 'worker' or 'supervisor'"}}
 	}
 
+	// Check if session already exists in agents — restore its role
+	effectiveRole := p.Role
+	var existingRole string
+	if err := d.db.QueryRow(`SELECT role FROM agents WHERE session_id = ?`, p.SessionID).Scan(&existingRole); err == nil {
+		effectiveRole = existingRole
+		d.db.Exec(`UPDATE agents SET connected = 1, last_seen_at = unixepoch() WHERE session_id = ?`, p.SessionID)
+	} else {
+		d.db.Exec(`INSERT INTO agents (session_id, role, connected, registered_at, last_seen_at) VALUES (?, ?, 1, unixepoch(), unixepoch())`,
+			p.SessionID, effectiveRole)
+	}
+
 	d.mu.Lock()
 	info.sessionID = p.SessionID
-	info.role = p.Role
+	info.role = effectiveRole
 	d.mu.Unlock()
 
-	slog.Info("client registered", "session", p.SessionID, "role", p.Role)
-	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]string{"status": "registered"}}
+	slog.Info("client registered", "session", p.SessionID, "role", effectiveRole)
+	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]string{"status": "registered", "role": effectiveRole}}
 }
 
 func (d *daemon) handleAssumeRole(req *jsonrpcRequest, info *clientInfo) *jsonrpcResponse {
 	var p struct {
-		Role string `json:"role"`
+		Role      string `json:"role"`
+		SessionID string `json:"session_id"`
 	}
 	if err := json.Unmarshal(req.Params, &p); err != nil {
 		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "invalid params"}}
@@ -299,34 +316,59 @@ func (d *daemon) handleAssumeRole(req *jsonrpcRequest, info *clientInfo) *jsonrp
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// Singleton check: only one supervisor at a time
+	// If caller provides a stable session_id, update the client identity
+	if p.SessionID != "" && p.SessionID != info.sessionID {
+		oldSess := info.sessionID
+		// Mark old session disconnected
+		d.db.Exec(`UPDATE agents SET connected = 0, last_seen_at = unixepoch() WHERE session_id = ?`, oldSess)
+		info.sessionID = p.SessionID
+		// Upsert new session in agents
+		d.db.Exec(`INSERT INTO agents (session_id, role, connected, registered_at, last_seen_at) VALUES (?, ?, 1, unixepoch(), unixepoch())
+			ON CONFLICT(session_id) DO UPDATE SET connected = 1, last_seen_at = unixepoch()`, p.SessionID, p.Role)
+		slog.Info("client session changed", "from", oldSess, "to", p.SessionID)
+	}
+
+	// Singleton check: only one connected supervisor at a time
 	if p.Role == "supervisor" {
-		for _, ci := range d.clients {
-			if ci != info && ci.role == "supervisor" {
-				return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{
-					Code:    -32603,
-					Message: fmt.Sprintf("supervisor already active (session %s)", ci.sessionID),
-				}}
-			}
+		var existingSess string
+		err := d.db.QueryRow(`SELECT session_id FROM agents WHERE role = 'supervisor' AND connected = 1 AND session_id != ?`, info.sessionID).Scan(&existingSess)
+		if err == nil {
+			return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{
+				Code:    -32603,
+				Message: fmt.Sprintf("supervisor already active (session %s)", existingSess),
+			}}
 		}
 	}
 
 	oldRole := info.role
 	info.role = p.Role
+
+	// Persist role change in agents table
+	d.db.Exec(`UPDATE agents SET role = ?, last_seen_at = unixepoch() WHERE session_id = ?`, p.Role, info.sessionID)
+
 	slog.Info("client role changed", "session", info.sessionID, "from", oldRole, "to", p.Role)
 	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]string{"status": "role_changed", "role": p.Role}}
 }
 
 func (d *daemon) handleListWorkers(req *jsonrpcRequest) *jsonrpcResponse {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	rows, err := d.db.Query(`SELECT session_id, role, registered_at, last_seen_at FROM agents WHERE connected = 1`)
+	if err != nil {
+		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32603, Message: err.Error()}}
+	}
+	defer rows.Close()
 
-	workers := make([]map[string]string, 0, len(d.clients))
-	for conn, ci := range d.clients {
-		workers = append(workers, map[string]string{
-			"session_id":  ci.sessionID,
-			"role":        ci.role,
-			"remote_addr": conn.RemoteAddr().String(),
+	workers := make([]map[string]any, 0)
+	for rows.Next() {
+		var sessID, role string
+		var regAt, lastSeen int64
+		if err := rows.Scan(&sessID, &role, &regAt, &lastSeen); err != nil {
+			continue
+		}
+		workers = append(workers, map[string]any{
+			"session_id":    sessID,
+			"role":          role,
+			"registered_at": regAt,
+			"last_seen_at":  lastSeen,
 		})
 	}
 	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: workers}

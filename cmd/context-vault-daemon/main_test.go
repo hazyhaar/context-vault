@@ -172,6 +172,42 @@ func TestDaemon_ListWorkers(t *testing.T) {
 	}
 }
 
+func TestDaemon_AgentsRoleRestore(t *testing.T) {
+	d, ln := testDaemon(t)
+
+	// Client registers as worker, then assumes supervisor
+	c1, s1 := dial(t, ln)
+	rpcCall(t, c1, s1, "register", map[string]string{"session_id": "stable-uuid", "role": "worker"})
+	rpcCall(t, c1, s1, "vault/assume_role", map[string]string{"role": "supervisor"})
+
+	// Verify agents table has supervisor role
+	var role string
+	d.db.QueryRow(`SELECT role FROM agents WHERE session_id = 'stable-uuid'`).Scan(&role)
+	if role != "supervisor" {
+		t.Fatalf("expected role=supervisor in agents, got %q", role)
+	}
+
+	// Disconnect (close the connection)
+	c1.Close()
+	// Give removeClient time to run
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify disconnected but role preserved
+	var connected int
+	d.db.QueryRow(`SELECT connected FROM agents WHERE session_id = 'stable-uuid'`).Scan(&connected)
+	if connected != 0 {
+		t.Fatal("expected connected=0 after disconnect")
+	}
+
+	// Reconnect with same session_id, default role=worker — should restore supervisor
+	c2, s2 := dial(t, ln)
+	resp := rpcCall(t, c2, s2, "register", map[string]string{"session_id": "stable-uuid", "role": "worker"})
+	resultBytes, _ := json.Marshal(resp.Result)
+	if !strings.Contains(string(resultBytes), "supervisor") {
+		t.Fatalf("expected role restored to supervisor, got: %s", string(resultBytes))
+	}
+}
+
 func TestDaemon_UnknownMethod(t *testing.T) {
 	_, ln := testDaemon(t)
 	conn, scanner := dial(t, ln)
