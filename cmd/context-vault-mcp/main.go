@@ -84,6 +84,11 @@ type daemonConn struct {
 	enc     *json.Encoder
 	scanner *bufio.Scanner
 	mu      sync.Mutex // serializes writes to daemon
+
+	// Mux fields — populated by startMux
+	muxed  bool
+	respCh chan *jsonrpcResponse // responses (messages with id)
+	closed chan struct{}         // closed when read goroutine exits
 }
 
 func dialDaemon(addr string) (*daemonConn, error) {
@@ -111,10 +116,68 @@ func dialDaemon(addr string) (*daemonConn, error) {
 	}, nil
 }
 
+const callTimeout = 10 * time.Second
+
+// startMux launches a read goroutine that continuously reads from the TCP connection.
+// Messages with an id field are routed to respCh (responses).
+// Messages without id (notifications, method notify/*) are forwarded via onNotif.
+// When the connection closes, the closed channel is closed.
+func (dc *daemonConn) startMux(onNotif func(jsonrpcNotification)) {
+	dc.respCh = make(chan *jsonrpcResponse, 16)
+	dc.closed = make(chan struct{})
+	dc.muxed = true
+
+	go func() {
+		defer close(dc.closed)
+		defer close(dc.respCh)
+
+		for dc.scanner.Scan() {
+			line := dc.scanner.Bytes()
+			if len(line) == 0 {
+				continue
+			}
+
+			// Peek: does the message have an "id" field?
+			var peek struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := json.Unmarshal(line, &peek); err != nil {
+				slog.Warn("mux: invalid json from daemon", "err", err)
+				continue
+			}
+
+			if len(peek.ID) > 0 && string(peek.ID) != "null" {
+				// Response — route to respCh
+				var resp jsonrpcResponse
+				if err := json.Unmarshal(line, &resp); err != nil {
+					slog.Warn("mux: unmarshal response", "err", err)
+					continue
+				}
+				dc.respCh <- &resp
+			} else {
+				// Notification — forward
+				var notif jsonrpcNotification
+				if err := json.Unmarshal(line, &notif); err != nil {
+					slog.Warn("mux: unmarshal notification", "err", err)
+					continue
+				}
+				if onNotif != nil {
+					onNotif(notif)
+				}
+			}
+		}
+		if err := dc.scanner.Err(); err != nil {
+			slog.Warn("mux: scanner error", "err", err)
+		}
+	}()
+}
+
 // callDaemon sends a JSON-RPC request to the daemon and returns the response.
+// Pre-mux: reads synchronously from scanner (used for register before mux starts).
+// Post-mux: sends request and waits on respCh with timeout.
 func (dc *daemonConn) callDaemon(method string, params json.RawMessage) (*jsonrpcResponse, error) {
 	dc.mu.Lock()
-	defer dc.mu.Unlock()
 
 	req := jsonrpcRequest{
 		JSONRPC: "2.0",
@@ -123,25 +186,106 @@ func (dc *daemonConn) callDaemon(method string, params json.RawMessage) (*jsonrp
 		Params:  params,
 	}
 	if err := dc.enc.Encode(req); err != nil {
+		dc.mu.Unlock()
 		return nil, err
 	}
 
-	if !dc.scanner.Scan() {
-		if err := dc.scanner.Err(); err != nil {
+	// Pre-mux: synchronous read (used for register)
+	if !dc.muxed {
+		defer dc.mu.Unlock()
+		if !dc.scanner.Scan() {
+			if err := dc.scanner.Err(); err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("daemon connection closed")
+		}
+		var resp jsonrpcResponse
+		if err := json.Unmarshal(dc.scanner.Bytes(), &resp); err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("daemon connection closed")
+		return &resp, nil
 	}
 
-	var resp jsonrpcResponse
-	if err := json.Unmarshal(dc.scanner.Bytes(), &resp); err != nil {
-		return nil, err
+	// Post-mux: wait on channel
+	dc.mu.Unlock()
+	select {
+	case resp, ok := <-dc.respCh:
+		if !ok {
+			return nil, fmt.Errorf("daemon connection closed")
+		}
+		return resp, nil
+	case <-dc.closed:
+		return nil, fmt.Errorf("daemon connection closed")
+	case <-time.After(callTimeout):
+		return nil, fmt.Errorf("daemon call timeout (%s)", callTimeout)
 	}
-	return &resp, nil
 }
 
 func (dc *daemonConn) close() {
 	dc.conn.Close()
+}
+
+// forwardNotification writes a daemon notification as an MCP channel event on stdout.
+// Uses notifications/claude/channel with content+meta (same format as mcp.go channelPollCheckpoints).
+// Maps notify/checkpoint_created → event "checkpoint_created", etc.
+func forwardNotification(out *stdoutWriter, notif jsonrpcNotification) {
+	// Extract event name from method: "notify/checkpoint_created" → "checkpoint_created"
+	event := notif.Method
+	if i := strings.LastIndex(event, "/"); i >= 0 {
+		event = event[i+1:]
+	}
+
+	// Extract params as map for building content and meta
+	paramsMap, _ := toStringMap(notif.Params)
+
+	// Build human-readable content string
+	content := buildChannelContent(event, paramsMap)
+
+	// Build meta: event + all scalar params as strings (checkpoint_id, label, etc.)
+	meta := map[string]string{"event": event}
+	for k, v := range paramsMap {
+		meta[k] = fmt.Sprintf("%v", v)
+	}
+
+	msg := jsonrpcNotification{
+		JSONRPC: "2.0",
+		Method:  "notifications/claude/channel",
+		Params: map[string]any{
+			"content": content,
+			"meta":    meta,
+		},
+	}
+	if err := out.encode(msg); err != nil {
+		slog.Warn("forward notification failed", "event", event, "err", err)
+	}
+}
+
+// toStringMap converts params (any) to map[string]any, handling json.RawMessage.
+func toStringMap(v any) (map[string]any, bool) {
+	switch p := v.(type) {
+	case map[string]any:
+		return p, true
+	case json.RawMessage:
+		var m map[string]any
+		if json.Unmarshal(p, &m) == nil {
+			return m, true
+		}
+	}
+	return nil, false
+}
+
+// buildChannelContent creates a human-readable string for the channel event body.
+func buildChannelContent(event string, params map[string]any) string {
+	switch event {
+	case "checkpoint_answered":
+		return fmt.Sprintf("Checkpoint #%v answered.\nLabel: %v\nAnswer: %v",
+			params["checkpoint_id"], params["label"], params["answer"])
+	case "checkpoint_created":
+		return fmt.Sprintf("Checkpoint #%v created.\nLabel: %v\nQuestion: %v",
+			params["checkpoint_id"], params["label"], params["question"])
+	default:
+		return fmt.Sprintf("Event: %s\nParams: %v", event, params)
+	}
 }
 
 // ── Tool name translation ────────────────────────────────────────────────────
@@ -293,6 +437,14 @@ func toolDefinitions() []mcpToolDef {
 				},
 			},
 		},
+		{
+			Name:        "vault_list_workers",
+			Description: "Liste les clients connectes au daemon (session_id, role, remote_addr).",
+			InputSchema: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
 	}
 }
 
@@ -322,7 +474,7 @@ func main() {
 	} else {
 		defer dc.close()
 
-		// Register with daemon
+		// Register with daemon (pre-mux, synchronous)
 		sessionID := os.Getenv("CLAUDE_SESSION_ID")
 		if sessionID == "" {
 			sessionID = fmt.Sprintf("mcp-%d", os.Getpid())
@@ -339,6 +491,11 @@ func main() {
 			}
 		} else {
 			slog.Info("registered with daemon", "session", sessionID, "role", *roleFlag)
+
+			// Start TCP mux — continuous read, dispatch notifications to MCP stdout
+			dc.startMux(func(notif jsonrpcNotification) {
+				forwardNotification(out, notif)
+			})
 		}
 	}
 

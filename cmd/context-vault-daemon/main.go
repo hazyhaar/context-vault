@@ -132,11 +132,17 @@ func (d *daemon) handleConn(ctx context.Context, conn net.Conn) {
 // ── Request router ───────────────────────────────────────────────────────────
 
 func (d *daemon) handleRequest(req *jsonrpcRequest, info *clientInfo) *jsonrpcResponse {
+	// Per-request vault scoped to the client's session ID.
+	// This ensures session_origin is set correctly on created entities.
+	sv := d.v.WithSession(info.sessionID)
+
 	switch req.Method {
 	case "register":
 		return d.handleRegister(req, info)
 	case "vault/assume_role":
 		return d.handleAssumeRole(req, info)
+	case "vault/list_workers":
+		return d.handleListWorkers(req)
 	case "vault/get_context":
 		return d.callTool(req, func(args json.RawMessage) vault.Result {
 			var p struct {
@@ -144,7 +150,7 @@ func (d *daemon) handleRequest(req *jsonrpcRequest, info *clientInfo) *jsonrpcRe
 				Session   string `json:"session"`
 			}
 			json.Unmarshal(args, &p)
-			return d.v.GetContext(p.Namespace, p.Session)
+			return sv.GetContext(p.Namespace, p.Session)
 		})
 	case "vault/search_entities":
 		return d.callTool(req, func(args json.RawMessage) vault.Result {
@@ -156,7 +162,7 @@ func (d *daemon) handleRequest(req *jsonrpcRequest, info *clientInfo) *jsonrpcRe
 				Limit     int    `json:"limit"`
 			}
 			json.Unmarshal(args, &p)
-			return d.v.SearchEntities(p.Type, p.Namespace, p.Query, p.Session, p.Limit)
+			return sv.SearchEntities(p.Type, p.Namespace, p.Query, p.Session, p.Limit)
 		})
 	case "vault/upsert_entity":
 		return d.callTool(req, func(args json.RawMessage) vault.Result {
@@ -171,7 +177,7 @@ func (d *daemon) handleRequest(req *jsonrpcRequest, info *clientInfo) *jsonrpcRe
 			if err := json.Unmarshal(args, &p); err != nil {
 				return vault.ErrorResult("invalid params: " + err.Error())
 			}
-			return d.v.UpsertEntity(p.ID, p.Namespace, p.Type, p.Label, p.Sensitivity, p.Meta)
+			return sv.UpsertEntity(p.ID, p.Namespace, p.Type, p.Label, p.Sensitivity, p.Meta)
 		})
 	case "vault/todo_transition":
 		return d.callTool(req, func(args json.RawMessage) vault.Result {
@@ -182,7 +188,7 @@ func (d *daemon) handleRequest(req *jsonrpcRequest, info *clientInfo) *jsonrpcRe
 			if err := json.Unmarshal(args, &p); err != nil {
 				return vault.ErrorResult("invalid params: " + err.Error())
 			}
-			return d.v.TodoTransition(p.ID, p.Status)
+			return sv.TodoTransition(p.ID, p.Status)
 		})
 	case "vault/list_todos":
 		return d.callTool(req, func(args json.RawMessage) vault.Result {
@@ -192,7 +198,7 @@ func (d *daemon) handleRequest(req *jsonrpcRequest, info *clientInfo) *jsonrpcRe
 				IncludeDone bool   `json:"include_done"`
 			}
 			json.Unmarshal(args, &p)
-			return d.v.ListTodos(p.Namespace, p.Session, p.IncludeDone)
+			return sv.ListTodos(p.Namespace, p.Session, p.IncludeDone)
 		})
 	case "vault/create_relation":
 		return d.callTool(req, func(args json.RawMessage) vault.Result {
@@ -204,7 +210,7 @@ func (d *daemon) handleRequest(req *jsonrpcRequest, info *clientInfo) *jsonrpcRe
 			if err := json.Unmarshal(args, &p); err != nil {
 				return vault.ErrorResult("invalid params: " + err.Error())
 			}
-			return d.v.CreateRelation(p.FromID, p.ToID, p.Type)
+			return sv.CreateRelation(p.FromID, p.ToID, p.Type)
 		})
 	case "vault/delete_entity":
 		return d.callTool(req, func(args json.RawMessage) vault.Result {
@@ -214,7 +220,7 @@ func (d *daemon) handleRequest(req *jsonrpcRequest, info *clientInfo) *jsonrpcRe
 			if err := json.Unmarshal(args, &p); err != nil {
 				return vault.ErrorResult("invalid params: " + err.Error())
 			}
-			return d.v.DeleteEntity(p.ID)
+			return sv.DeleteEntity(p.ID)
 		})
 	case "vault/add_steps":
 		return d.callTool(req, func(args json.RawMessage) vault.Result {
@@ -225,7 +231,7 @@ func (d *daemon) handleRequest(req *jsonrpcRequest, info *clientInfo) *jsonrpcRe
 			if err := json.Unmarshal(args, &p); err != nil {
 				return vault.ErrorResult("invalid params: " + err.Error())
 			}
-			return d.v.AddSteps(p.TodoID, p.Steps)
+			return sv.AddSteps(p.TodoID, p.Steps)
 		})
 	case "vault/step_done":
 		return d.callTool(req, func(args json.RawMessage) vault.Result {
@@ -236,7 +242,7 @@ func (d *daemon) handleRequest(req *jsonrpcRequest, info *clientInfo) *jsonrpcRe
 			if err := json.Unmarshal(args, &p); err != nil {
 				return vault.ErrorResult("invalid params: " + err.Error())
 			}
-			return d.v.StepDone(p.TodoID, p.Step)
+			return sv.StepDone(p.TodoID, p.Step)
 		})
 	case "vault/get_entity":
 		return d.callTool(req, func(args json.RawMessage) vault.Result {
@@ -246,7 +252,7 @@ func (d *daemon) handleRequest(req *jsonrpcRequest, info *clientInfo) *jsonrpcRe
 			if err := json.Unmarshal(args, &p); err != nil {
 				return vault.ErrorResult("invalid params: " + err.Error())
 			}
-			return d.v.GetEntity(p.ID)
+			return sv.GetEntity(p.ID)
 		})
 	default:
 		return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32601, Message: "method not found: " + req.Method}}
@@ -309,6 +315,21 @@ func (d *daemon) handleAssumeRole(req *jsonrpcRequest, info *clientInfo) *jsonrp
 	info.role = p.Role
 	slog.Info("client role changed", "session", info.sessionID, "from", oldRole, "to", p.Role)
 	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]string{"status": "role_changed", "role": p.Role}}
+}
+
+func (d *daemon) handleListWorkers(req *jsonrpcRequest) *jsonrpcResponse {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	workers := make([]map[string]string, 0, len(d.clients))
+	for conn, ci := range d.clients {
+		workers = append(workers, map[string]string{
+			"session_id":  ci.sessionID,
+			"role":        ci.role,
+			"remote_addr": conn.RemoteAddr().String(),
+		})
+	}
+	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: workers}
 }
 
 // ── Checkpoint watcher ───────────────────────────────────────────────────────

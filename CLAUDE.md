@@ -25,7 +25,7 @@ Serveur HTTP hooks pour mémoire persistante Claude Code. Reçoit les événemen
 | Fichier | Rôle |
 |---------|------|
 | `cmd/context-vault/main.go` | Serveur HTTP, schema SQLite, RingDumper, tous les handlers |
-| `cmd/context-vault/mcp.go` | Serveur MCP stdio (JSON-RPC 2.0), 9 outils vault CRUD |
+| `cmd/context-vault/mcp.go` | Serveur MCP stdio (JSON-RPC 2.0), 10 outils vault CRUD |
 | `scripts/run.sh` | Lanceur SessionStart — démarre le binaire si port libre |
 | `skills/prends-note/SKILL.md` | Skill : LLM inscrit des entités en DB de sa propre initiative |
 | `skills/hot-contexte/SKILL.md` | Skill : SELECT ciblé avant compaction |

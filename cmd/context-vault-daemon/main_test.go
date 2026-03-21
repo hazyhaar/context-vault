@@ -125,6 +125,53 @@ func TestDaemon_UpsertAndGet(t *testing.T) {
 	}
 }
 
+func TestDaemon_SessionOriginInjected(t *testing.T) {
+	d, ln := testDaemon(t)
+	conn, scanner := dial(t, ln)
+
+	// Register with a session ID
+	rpcCall(t, conn, scanner, "register", map[string]string{"session_id": "sess-42", "role": "worker"})
+
+	// Create an entity — session_origin should be "sess-42"
+	resp := rpcCall(t, conn, scanner, "vault/upsert_entity", map[string]any{
+		"namespace": "test", "type": "decision", "label": "session origin test", "meta": map[string]any{},
+	})
+	if resp.Error != nil {
+		t.Fatalf("upsert error: %s", resp.Error.Message)
+	}
+
+	// Verify session_origin in DB
+	var sessionOrigin string
+	err := d.db.QueryRow(`SELECT COALESCE(session_origin, '') FROM entities WHERE id = 1`).Scan(&sessionOrigin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sessionOrigin != "sess-42" {
+		t.Fatalf("expected session_origin='sess-42', got %q", sessionOrigin)
+	}
+}
+
+func TestDaemon_ListWorkers(t *testing.T) {
+	_, ln := testDaemon(t)
+
+	// Connect 2 clients
+	c1, s1 := dial(t, ln)
+	rpcCall(t, c1, s1, "register", map[string]string{"session_id": "w1", "role": "worker"})
+	c2, s2 := dial(t, ln)
+	rpcCall(t, c2, s2, "register", map[string]string{"session_id": "s1", "role": "supervisor"})
+
+	// List workers from client 1
+	resp := rpcCall(t, c1, s1, "vault/list_workers", map[string]any{})
+	if resp.Error != nil {
+		t.Fatalf("list_workers error: %s", resp.Error.Message)
+	}
+	resultBytes, _ := json.Marshal(resp.Result)
+	rs := string(resultBytes)
+	if !strings.Contains(rs, "w1") || !strings.Contains(rs, "s1") {
+		t.Fatalf("expected both clients in list, got: %s", rs)
+	}
+}
+
 func TestDaemon_UnknownMethod(t *testing.T) {
 	_, ln := testDaemon(t)
 	conn, scanner := dial(t, ln)
@@ -211,8 +258,8 @@ func TestE2E_CheckpointRouting(t *testing.T) {
 	supConn, supScanner := dial(t, ln)
 	rpcCall(t, supConn, supScanner, "register", map[string]string{"session_id": "sup-1", "role": "supervisor"})
 
-	// Worker creates a blocking checkpoint (session_origin set manually since vault.SessionFn returns "")
-	// We need to set session_origin on the entity — use direct DB for that
+	// Worker creates a blocking checkpoint — session_origin is now set
+	// automatically via WithSession(info.sessionID) in handleRequest.
 	resp := rpcCall(t, workerConn, workerScanner, "vault/upsert_entity", map[string]any{
 		"namespace": "test",
 		"type":      "checkpoint",
@@ -226,9 +273,6 @@ func TestE2E_CheckpointRouting(t *testing.T) {
 	if !strings.Contains(string(resultBytes), "created entity") {
 		t.Fatalf("expected created entity, got: %s", string(resultBytes))
 	}
-
-	// Set session_origin on the checkpoint to "worker-1" (the daemon's SessionFn returns "")
-	d.db.Exec(`UPDATE entities SET session_origin = 'worker-1' WHERE id = 1`)
 
 	// Wait for watcher to detect the new checkpoint and push to supervisor
 	supConn.SetReadDeadline(time.Now().Add(5 * time.Second))

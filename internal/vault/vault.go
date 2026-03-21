@@ -27,6 +27,13 @@ func New(db *sql.DB, sessionFn func() string) *Vault {
 	return &Vault{DB: db, SessionFn: sessionFn}
 }
 
+// WithSession returns a shallow copy of the Vault whose SessionFn always
+// returns sessionID. Useful in the daemon where each request carries a
+// different client session.
+func (v *Vault) WithSession(sessionID string) *Vault {
+	return &Vault{DB: v.DB, SessionFn: func() string { return sessionID }}
+}
+
 // StepKey extracts the dedup key from a step name: prefix before ':' (trimmed), or the full name.
 func StepKey(step string) string {
 	if i := strings.IndexByte(step, ':'); i > 0 {
