@@ -1,26 +1,14 @@
 {
   "name": "context-vault",
-  "version": "1.2.0",
-  "description": "Persistent structured memory for Claude Code. SQLite JSONB vault with 7 MCP tools for entity CRUD, todos with dependencies, and context injection across compactions.",
+  "version": "2.0.0",
+  "description": "Persistent structured memory for Claude Code. Daemon TCP + MCP tools for entity CRUD, todos with steps and dependencies, missions, checkpoints, and multi-terminal supervision.",
   "author": {
     "name": "hazyhaar",
     "url": "https://github.com/hazyhaar"
   },
   "license": "MIT",
   "repository": "https://github.com/hazyhaar/context-vault",
-  "keywords": ["memory", "sqlite", "jsonb", "compaction", "context", "notes", "todos", "mcp"],
-  "category": "productivity",
-  "skills": "./skills/",
-  "commands": "./.claude/commands/",
-  "hooks": {
-    "SessionStart":        [{"hooks": [{"type": "command", "command": "./scripts/run.sh"}, {"type": "http", "url": "http://localhost:9742/hook/session-start", "timeout": 5}]}],
-    "UserPromptSubmit":    [{"hooks": [{"type": "http", "url": "http://localhost:9742/hook/user-prompt",        "timeout": 3}]}],
-    "PostToolUse":         [{"hooks": [{"type": "http", "url": "http://localhost:9742/hook/post-tool",          "timeout": 5}]}],
-    "PostToolUseFailure":  [{"hooks": [{"type": "http", "url": "http://localhost:9742/hook/post-tool-failure",  "timeout": 5}]}],
-    "Stop":                [{"hooks": [{"type": "http", "url": "http://localhost:9742/hook/stop",               "timeout": 5}]}],
-    "SubagentStop":        [{"hooks": [{"type": "http", "url": "http://localhost:9742/hook/subagent-stop",      "timeout": 5}]}],
-    "PreCompact":          [{"hooks": [{"type": "http", "url": "http://localhost:9742/hook/pre-compact",        "timeout": 10}]}],
-    "SessionEnd":          [{"hooks": [{"type": "http", "url": "http://localhost:9742/hook/session-end",        "timeout": 5}]}],
-    "Setup":               [{"hooks": [{"type": "http", "url": "http://localhost:9742/hook/setup",              "timeout": 30}]}]
-  }
+  "homepage": "https://github.com/hazyhaar/context-vault",
+  "keywords": ["memory", "sqlite", "todos", "mcp", "supervision", "checkpoints", "missions", "multi-terminal"],
+  "category": "productivity"
 }
