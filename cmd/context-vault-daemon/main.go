@@ -398,7 +398,7 @@ func (d *daemon) handleListWorkers(req *jsonrpcRequest) *jsonrpcResponse {
 			"last_seen_at":  lastSeen,
 		})
 	}
-	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: workers}
+	return &jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"workers": workers}}
 }
 
 // checkNoSupervisor alerts all connected clients if no supervisor is active.
@@ -536,6 +536,9 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// Reset all sessions to disconnected on startup — no TCP connections exist yet.
+	db.Exec(`UPDATE agents SET connected = 0`)
 
 	d := newDaemon(db)
 
